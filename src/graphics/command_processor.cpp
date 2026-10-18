@@ -41,6 +41,12 @@
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
+REXCVAR_DEFINE_INT32(gpu_max_frames_in_flight, 3, "GPU",
+                     "Guest frames the host GPU may be behind the command processor (1-3). "
+                     "Lower keeps the game from running as far ahead of the screen when the "
+                     "host GPU is the bottleneck, at some throughput cost")
+    .range(1, 3);
+
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
                     "Refresh page-valid state from GPU-written memory at frame end. "
                     "Disable for minor CPU overhead reduction, but may break memory coherency.")

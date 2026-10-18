@@ -18,6 +18,7 @@
 #include <rex/input/flags.h>
 #include <rex/input/xinput/xinput_input_driver.h>
 #include <rex/logging.h>
+#include <rex/ui/frame_pacing.h>
 #include <rex/ui/virtual_key.h>
 #include <xinput.h>  // NOLINT(build/include_order)
 
@@ -216,6 +217,7 @@ X_RESULT XinputInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state
     return result;
   }
 
+  rex::ui::frame_pacing::Record(rex::ui::frame_pacing::Event::kInputPoll, uint64_t(id), 0);
   out_state->packet_number = native_state.state.dwPacketNumber;
   out_state->gamepad.buttons = native_state.state.Gamepad.wButtons;
   out_state->gamepad.left_trigger = native_state.state.Gamepad.bLeftTrigger;

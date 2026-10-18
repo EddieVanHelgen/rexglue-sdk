@@ -90,12 +90,17 @@ class SDLInputDriver final : public InputDriver, public rex::ui::WindowListener 
   bool TestSDLVersion() const;
   void UpdateXCapabilities(ControllerState& state);
   void QueueControllerUpdate();
+  // input_poll_on_read: reads the controllers on the calling thread.
+  void UpdateControllersNow();
 
   rex::ui::Window* attached_window_ = nullptr;
   bool sdl_events_initialized_;
   bool SDL_Gamepad_initialized_;
   std::atomic<int> sdl_events_unflushed_;
   std::atomic<bool> sdl_pumpevents_queued_;
+  // steady_clock nanoseconds of the last controller update (event pump or
+  // UpdateControllersNow), for the age of the state given to the title.
+  std::atomic<int64_t> last_update_ns_{0};
   // Appended in connection order, never re-sorted, and unbounded: the
   // assignment decides how many the guest sees.
   std::vector<ControllerState> controllers_;

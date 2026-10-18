@@ -38,6 +38,13 @@ REXCVAR_DEFINE_BOOL(host_vblank_pacing, false, "UI/Presenter",
                     "and a refresh rate that is a multiple of the guest's (60, 120, 240 Hz)")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_DOUBLE(host_vblank_late_latch_ms, 0.0, "UI/Presenter",
+                      "host_vblank_pacing: a frame that arrives up to this many ms after a guest "
+                      "vblank is presented for that vblank rather than the next one, a whole "
+                      "guest frame sooner. Titles that swap on the vblank deliver frames just "
+                      "after it. 0 = off")
+    .range(0.0, 8.0);
+
 // Graphics card selection, read by the Vulkan and the Direct3D 12 providers
 // (defined here because either backend may be left out of the build).
 REXCVAR_DEFINE_STRING(
@@ -625,6 +632,7 @@ bool Presenter::RefreshGuestOutput(
                                           });
     host_vblank_ready_seq_ = writable_properties.frame_seq;
   }
+  bool host_vblank_late_latched = false;
 
   // Make the new image the next to present on the host (the "ready" one),
   // replacing the one already specified as the next (dropping it instead of
@@ -667,7 +675,23 @@ bool Presenter::RefreshGuestOutput(
   // done at the next guest vblank instead.
   PaintResult paint_result = PaintResult::kNotPresented;
   if (host_vblank_paced) {
+    // Published in time for the last guest vblank's late latch.
+    if (host_vblank_late_latch_deadline_ns_ &&
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+                .count() <= host_vblank_late_latch_deadline_ns_) {
+      host_vblank_latched_seq_ = host_vblank_ready_seq_;
+      host_vblank_late_latched = true;
+    }
+    host_vblank_late_latch_deadline_ns_ = 0;
     host_vblank_latch_lock.unlock();
+    if (host_vblank_late_latched) {
+      std::lock_guard<std::mutex> paint_mode_mutex_lock(paint_mode_mutex_);
+      if (paint_mode_ == PaintMode::kUIThreadOnRequest) {
+        // Already past this vblank's UI tick - don't wait for the next one.
+        RequestPaintOrConnectionRecoveryViaWindow(true);
+      }
+    }
   } else {
     std::lock_guard<std::mutex> paint_mode_mutex_lock(paint_mode_mutex_);
     switch (paint_mode_) {
@@ -1470,13 +1494,22 @@ bool Presenter::IsHostVblankPacingActive() const {
 }
 
 void Presenter::OnGuestVblankLatch() {
-  host_vblank_last_latch_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                       std::chrono::steady_clock::now().time_since_epoch())
-                                       .count(),
-                                   std::memory_order_relaxed);
+  const int64_t now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now().time_since_epoch())
+                             .count();
+  host_vblank_last_latch_ns_.store(now_ns, std::memory_order_relaxed);
+  const double late_latch_ms = REXCVAR_GET(host_vblank_late_latch_ms);
+  bool request_paint = true;
   {
     std::lock_guard<std::mutex> latch_lock(host_vblank_latch_mutex_);
-    host_vblank_latched_seq_ = host_vblank_ready_seq_;
+    if (late_latch_ms > 0.0 && host_vblank_ready_seq_ <= host_vblank_latched_seq_) {
+      // Nothing new to show yet - wait for the frame this vblank releases.
+      host_vblank_late_latch_deadline_ns_ = now_ns + int64_t(late_latch_ms * 1'000'000.0);
+      request_paint = false;
+    } else {
+      host_vblank_late_latch_deadline_ns_ = 0;
+      host_vblank_latched_seq_ = host_vblank_ready_seq_;
+    }
   }
 #if REX_PLATFORM_WIN32
   {
@@ -1485,6 +1518,9 @@ void Presenter::OnGuestVblankLatch() {
   }
   dxgi_ui_tick_signal_condition_.notify_all();
 #endif
+  if (!request_paint) {
+    return;
+  }
   std::lock_guard<std::mutex> paint_mode_lock(paint_mode_mutex_);
   if (paint_mode_ == PaintMode::kUIThreadOnRequest) {
     RequestPaintOrConnectionRecoveryViaWindow(false);

@@ -36,6 +36,12 @@
 REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D12",
                     "Allow variable refresh rate and tearing");
 
+REXCVAR_DEFINE_INT32(present_max_frame_latency, 0, "UI/D3D12",
+                     "Presents that may be queued ahead of the display (1-3), waited for before "
+                     "painting. 0 leaves it to DXGI (3)")
+    .range(0, 3)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::ui::d3d12 {
 
 // Generated with `xb buildshaders`.
@@ -377,7 +383,10 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
     }
     bool swap_chain_resized = SUCCEEDED(paint_context_.swap_chain->ResizeBuffers(
         0, UINT(new_swap_chain_width), UINT(new_swap_chain_height), DXGI_FORMAT_UNKNOWN,
-        paint_context_.swap_chain_allows_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0));
+        (paint_context_.swap_chain_allows_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0) |
+            (paint_context_.swap_chain_frame_latency_waitable
+                 ? DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
+                 : 0)));
     if (swap_chain_resized) {
       for (uint32_t i = 0; i < PaintContext::kSwapChainBufferCount; ++i) {
         if (FAILED(paint_context_.swap_chain->GetBuffer(
@@ -427,6 +436,10 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
       // rate.
       swap_chain_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
     }
+    const int32_t max_frame_latency = REXCVAR_GET(present_max_frame_latency);
+    if (max_frame_latency > 0) {
+      swap_chain_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    }
     IDXGIFactory2* dxgi_factory = provider_.GetDXGIFactory();
     ID3D12CommandQueue* direct_queue = provider_.GetDirectQueue();
     Microsoft::WRL::ComPtr<IDXGISwapChain1> swap_chain_1;
@@ -464,6 +477,17 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
     paint_context_.swap_chain_height = new_swap_chain_height;
     paint_context_.swap_chain_allows_tearing =
         (swap_chain_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
+    if (swap_chain_desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
+      if (SUCCEEDED(paint_context_.swap_chain->SetMaximumFrameLatency(UINT(max_frame_latency)))) {
+        paint_context_.swap_chain_frame_latency_waitable =
+            paint_context_.swap_chain->GetFrameLatencyWaitableObject();
+      }
+      if (!paint_context_.swap_chain_frame_latency_waitable) {
+        REXLOG_ERROR("D3D12Presenter: Failed to set the maximum frame latency of the swap chain");
+        paint_context_.DestroySwapChain();
+        return SurfacePaintConnectResult::kFailure;
+      }
+    }
     for (uint32_t i = 0; i < PaintContext::kSwapChainBufferCount; ++i) {
       if (FAILED(paint_context_.swap_chain->GetBuffer(
               i, IID_PPV_ARGS(&paint_context_.swap_chain_buffers[i])))) {
@@ -564,12 +588,21 @@ void D3D12Presenter::PaintContext::DestroySwapChain() {
     swap_chain_buffer_ref.Reset();
   }
   swap_chain.Reset();
+  if (swap_chain_frame_latency_waitable) {
+    CloseHandle(swap_chain_frame_latency_waitable);
+    swap_chain_frame_latency_waitable = nullptr;
+  }
   swap_chain_allows_tearing = false;
   swap_chain_height = 0;
   swap_chain_width = 0;
 }
 
 Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawers) {
+  // With present_max_frame_latency, don't queue more presents than that -
+  // bounded, so a lost signal can't hang painting.
+  if (paint_context_.swap_chain_frame_latency_waitable) {
+    WaitForSingleObjectEx(paint_context_.swap_chain_frame_latency_waitable, 100, TRUE);
+  }
   // Begin the command list with the command allocator not currently potentially
   // used on the GPU.
   const uint64_t current_paint_submission =
@@ -1196,6 +1229,10 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
                              (have_stats ? 4 : 0) | (host_vblank_paced ? 8 : 0) |
                              (grid_locked ? 16 : 0),
                          last_present_count, stats.PresentCount, stats.SyncRefreshCount);
+    if (have_stats && stats.PresentCount && stats.SyncQPCTime.QuadPart) {
+      frame_pacing::Record(frame_pacing::Event::kHostDisplay, stats.PresentCount,
+                           uint64_t(stats.SyncQPCTime.QuadPart));
+    }
   }
   // Even if presentation has failed, work might have been enqueued anyway
   // internally before the failure according to Jesse Natalie from the DirectX

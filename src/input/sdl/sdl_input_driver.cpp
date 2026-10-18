@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <filesystem>
 #include <string_view>
 
@@ -21,10 +22,16 @@
 #include <rex/input/flags.h>
 #include <rex/input/sdl/sdl_input_driver.h>
 #include <rex/logging.h>
+#include <rex/ui/frame_pacing.h>
 #include <rex/ui/virtual_key.h>
 
 REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
                       "Path to SDL gamecontroller mappings file");
+
+REXCVAR_DEFINE_BOOL(input_poll_on_read, false, "Input",
+                    "SDL: read the controller every time the game asks for its state, on the "
+                    "game's thread, instead of handing it the state from the last UI-thread "
+                    "event pump (up to a frame old)");
 
 namespace rex::input::sdl {
 
@@ -32,6 +39,12 @@ namespace {
 
 // SDL clamps to SDL_MAX_RUMBLE_DURATION_MS, which is not a public constant.
 constexpr uint32_t kRumbleDurationMs = 0xFFFF;
+
+int64_t SteadyNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
 
 const char* JoystickTypeName(SDL_JoystickType t) {
   switch (t) {
@@ -321,7 +334,11 @@ X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   auto is_active = this->is_active();
 
   if (is_active) {
-    QueueControllerUpdate();
+    if (REXCVAR_GET(input_poll_on_read)) {
+      UpdateControllersNow();
+    } else {
+      QueueControllerUpdate();
+    }
   }
 
   auto guard = DrainAndLock();
@@ -329,6 +346,13 @@ X_RESULT SDLInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
   auto controller = FindController(id);
   if (!controller) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  if (rex::ui::frame_pacing::Enabled()) {
+    const int64_t last_update_ns = last_update_ns_.load(std::memory_order_relaxed);
+    rex::ui::frame_pacing::Record(
+        rex::ui::frame_pacing::Event::kInputPoll, uint64_t(id),
+        last_update_ns ? uint64_t(std::max(int64_t(0), SteadyNowNs() - last_update_ns) / 1000)
+                       : 0);
   }
 
   // Make sure packet_number is only incremented by 1, even if there have been
@@ -847,9 +871,25 @@ void SDLInputDriver::QueueControllerUpdate() {
   if (!is_queued) {
     attached_window_->app_context().CallInUIThread([this]() {
       SDL_PumpEvents();
+      last_update_ns_.store(SteadyNowNs(), std::memory_order_relaxed);
       sdl_pumpevents_queued_ = false;
     });
   }
+}
+
+void SDLInputDriver::UpdateControllersNow() {
+  // The game may read several users in a row - once is enough for all of them.
+  constexpr int64_t kMinIntervalNs = 1'000'000;
+  const int64_t now_ns = SteadyNowNs();
+  if (now_ns - last_update_ns_.load(std::memory_order_relaxed) < kMinIntervalNs) {
+    return;
+  }
+  // Safe from any thread. The axis and button events it generates reach
+  // HandleEvent on this thread and are applied by DrainAndLock. Hot plugging
+  // still goes through the UI thread's event pump.
+  SDL_UpdateJoysticks();
+  last_update_ns_.store(SteadyNowNs(), std::memory_order_relaxed);
+  QueueControllerUpdate();
 }
 
 // Check if the analog inputs exceed their thresholds to become a button press

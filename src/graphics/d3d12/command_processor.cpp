@@ -3676,8 +3676,17 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   // Check the fence - needed for all kinds of submissions (to reclaim transient
   // resources early) and specifically for frames (not to queue too many), and
   // await the availability of the current frame.
-  CheckSubmissionCompletion(
-      is_opening_frame ? closed_frame_submissions_[frame_current_ % kQueueFrames] : 0);
+  // Below kQueueFrames, gpu_max_frames_in_flight awaits a more recent frame.
+  uint64_t await_frame_submission = 0;
+  if (is_opening_frame) {
+    const uint64_t frames_in_flight =
+        uint64_t(std::clamp(REXCVAR_GET(gpu_max_frames_in_flight), 1, int32_t(kQueueFrames)));
+    if (frame_current_ >= frames_in_flight) {
+      await_frame_submission =
+          closed_frame_submissions_[(frame_current_ - frames_in_flight) % kQueueFrames];
+    }
+  }
+  CheckSubmissionCompletion(await_frame_submission);
   // TODO(Triang3l): If failed to await (completed submission < awaited frame
   // submission), do something like dropping the draw command that wanted to
   // open the frame.
@@ -3692,6 +3701,8 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
       }
       frame_completed_ = frame;
     }
+    ui::frame_pacing::Record(ui::frame_pacing::Event::kGpuFrameOpen,
+                             frame_current_ - 1 - std::min(frame_completed_, frame_current_ - 1));
   }
 
   if (!submission_open_) {

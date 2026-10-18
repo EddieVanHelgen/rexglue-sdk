@@ -4,15 +4,22 @@
 
 #include <rex/ui/frame_pacing.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <vector>
+
+#include <fmt/format.h>
 
 #include <rex/cvar.h>
 #include <rex/filesystem.h>
+#include <rex/logging.h>
 #include <rex/platform.h>
 
 #if REX_PLATFORM_WIN32
@@ -45,14 +52,18 @@ class Trace {
     if (event == Event::kHostPresent && !config_dumped_.exchange(true)) {
       DumpConfig();
     }
-    const double t_us = std::chrono::duration<double, std::micro>(now - start_).count();
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (!file_) {
-      return;
+    std::string summary;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!file_) {
+        return;
+      }
+      WriteRowLocked(char(event), now, a, b, c, d, e, f);
+      TrackLatencyLocked(event, now, a, b, d, summary);
     }
-    std::fprintf(file_, "%c,%.1f,%llu,%llu,%llu,%llu,%llu,%llu\n", char(event), t_us,
-                 (unsigned long long)a, (unsigned long long)b, (unsigned long long)c,
-                 (unsigned long long)d, (unsigned long long)e, (unsigned long long)f);
+    if (!summary.empty()) {
+      REXLOG_INFO("frame_pacing: {}", summary);
+    }
   }
 
   // Runs at process exit, after the vblank thread is gone (it's detached, as
@@ -67,8 +78,154 @@ class Trace {
   }
 
  private:
+  using TimePoint = std::chrono::steady_clock::time_point;
+
+  // A guest frame on its way from the input read to the screen.
+  struct FrameLatency {
+    uint64_t seq = 0;
+    TimePoint input = {};  // Newest input read before its VdSwap, or empty.
+    int64_t input_age_us = 0;
+    TimePoint vdswap = {};
+    TimePoint present = {};
+    uint64_t present_count = 0;
+    bool displayed = false;
+  };
+  static constexpr size_t kFrameHistory = 64;
+  // A summary goes to the log every this many presented frames.
+  static constexpr size_t kSummaryFrames = 600;
+
+  static int64_t Us(TimePoint from, TimePoint to) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(to - from).count();
+  }
+
+  void WriteRowLocked(char type, TimePoint time, uint64_t a, uint64_t b, uint64_t c, uint64_t d,
+                      uint64_t e, uint64_t f) {
+    const double t_us = std::chrono::duration<double, std::micro>(time - start_).count();
+    std::fprintf(file_, "%c,%.1f,%llu,%llu,%llu,%llu,%llu,%llu\n", type, t_us,
+                 (unsigned long long)a, (unsigned long long)b, (unsigned long long)c,
+                 (unsigned long long)d, (unsigned long long)e, (unsigned long long)f);
+  }
+
+  void TrackLatencyLocked(Event event, TimePoint now, uint64_t a, uint64_t b, uint64_t d,
+                          std::string& summary_out) {
+    switch (event) {
+      case Event::kInputPoll:
+        last_input_ = now;
+        last_input_age_us_ = int64_t(b);
+        break;
+      case Event::kGuestVdSwap: {
+        // VdSwaps reach the command processor in order, as XE_SWAP packets.
+        FrameLatency frame;
+        if (last_input_ != TimePoint{} && now - last_input_ < std::chrono::milliseconds(200)) {
+          frame.input = last_input_;
+          frame.input_age_us = last_input_age_us_;
+        }
+        frame.vdswap = now;
+        pending_swaps_[pending_swap_end_++ % kPendingSwaps] = frame;
+        if (pending_swap_end_ - pending_swap_begin_ > kPendingSwaps) {
+          pending_swap_begin_ = pending_swap_end_ - kPendingSwaps;
+        }
+      } break;
+      case Event::kGuestSwap:
+        cp_swap_valid_ = pending_swap_begin_ < pending_swap_end_;
+        if (cp_swap_valid_) {
+          cp_swap_ = pending_swaps_[pending_swap_begin_++ % kPendingSwaps];
+        }
+        break;
+      case Event::kGuestOutput: {
+        FrameLatency& frame = frames_[a % kFrameHistory];
+        frame = cp_swap_valid_ ? cp_swap_ : FrameLatency{};
+        frame.seq = a;
+        cp_swap_valid_ = false;
+      } break;
+      case Event::kHostPresent: {
+        FrameLatency& frame = frames_[a % kFrameHistory];
+        if (!a || frame.seq != a || frame.present != TimePoint{} || frame.vdswap == TimePoint{}) {
+          break;
+        }
+        frame.present = now;
+        frame.present_count = d;
+        const bool has_input = frame.input != TimePoint{};
+        WriteRowLocked('L', now, a, has_input ? Us(frame.input, now) : 0, Us(frame.vdswap, now),
+                       frame.input_age_us, has_input ? Us(frame.input, frame.vdswap) : 0, 0);
+        if (has_input) {
+          input_to_present_ms_.push_back(Us(frame.input, now) / 1000.0);
+          input_age_ms_.push_back(frame.input_age_us / 1000.0);
+        }
+        vdswap_to_present_ms_.push_back(Us(frame.vdswap, now) / 1000.0);
+        if (vdswap_to_present_ms_.size() >= kSummaryFrames) {
+          summary_out = SummarizeLocked();
+        }
+      } break;
+      case Event::kHostDisplay: {
+#if REX_PLATFORM_WIN32
+        if (!qpc_frequency_) {
+          break;
+        }
+        const TimePoint shown =
+            qpc_origin_ + std::chrono::nanoseconds(int64_t(double(int64_t(b) - qpc_origin_ticks_) *
+                                                           1e9 / double(qpc_frequency_)));
+        for (FrameLatency& frame : frames_) {
+          if (frame.present_count != a || frame.displayed || frame.present == TimePoint{}) {
+            continue;
+          }
+          frame.displayed = true;
+          // Statistics from another present (after a swap chain reset).
+          if (shown < frame.present - std::chrono::milliseconds(1) ||
+              shown > frame.present + std::chrono::milliseconds(200)) {
+            break;
+          }
+          const bool has_input = frame.input != TimePoint{};
+          WriteRowLocked('D', shown, frame.seq, has_input ? Us(frame.input, shown) : 0,
+                         Us(frame.present, shown), Us(frame.vdswap, shown), 0, 0);
+          if (has_input) {
+            input_to_display_ms_.push_back(Us(frame.input, shown) / 1000.0);
+          }
+          present_to_display_ms_.push_back(Us(frame.present, shown) / 1000.0);
+          break;
+        }
+#endif
+      } break;
+      default:
+        break;
+    }
+  }
+
+  std::string SummarizeLocked() {
+    const auto describe = [](const char* name, std::vector<double>& values) {
+      if (values.empty()) {
+        return fmt::format("{} n/a", name);
+      }
+      std::sort(values.begin(), values.end());
+      double sum = 0.0;
+      for (double value : values) {
+        sum += value;
+      }
+      const std::string text = fmt::format(
+          "{} {:.1f} (p95 {:.1f})", name, sum / double(values.size()),
+          values[std::min(values.size() - 1, values.size() * 95 / 100)]);
+      values.clear();
+      return text;
+    };
+    // Field order: what matters most first.
+    std::string text = describe("input->screen ms", input_to_display_ms_);
+    text += ", " + describe("input->present", input_to_present_ms_);
+    text += ", " + describe("vdswap->present", vdswap_to_present_ms_);
+    text += ", " + describe("present->screen", present_to_display_ms_);
+    text += ", " + describe("input state age", input_age_ms_);
+    return text;
+  }
+
   void Open() {
     start_ = std::chrono::steady_clock::now();
+#if REX_PLATFORM_WIN32
+    LARGE_INTEGER frequency, ticks;
+    if (QueryPerformanceFrequency(&frequency) && QueryPerformanceCounter(&ticks)) {
+      qpc_origin_ = std::chrono::steady_clock::now();
+      qpc_origin_ticks_ = ticks.QuadPart;
+      qpc_frequency_ = frequency.QuadPart;
+    }
+#endif
     std::error_code ec;
     const std::filesystem::path dir = rex::filesystem::GetExecutableFolder() / "logs";
     std::filesystem::create_directories(dir, ec);
@@ -87,7 +244,9 @@ class Trace {
         "vsync", "pdz_fps60_unlock", "pdz_gpu_wait_mode", "graphics_backend",
         "render_target_path_d3d12", "resolution_scale", "video_mode_refresh_rate",
         "d3d12_allow_variable_refresh_rate_and_tearing", "host_present_from_non_ui_thread",
-        "d3d12_submit_on_primary_buffer_end", "framerate_limit", "host_vblank_pacing"};
+        "d3d12_submit_on_primary_buffer_end", "framerate_limit", "host_vblank_pacing",
+        "host_vblank_late_latch_ms", "gpu_max_frames_in_flight", "present_max_frame_latency",
+        "input_backend", "input_poll_on_read"};
     std::lock_guard<std::mutex> lock(mutex_);
     if (!file_) {
       return;
@@ -144,6 +303,27 @@ class Trace {
   std::FILE* file_ = nullptr;
   std::atomic<bool> running_{false};
   std::atomic<bool> config_dumped_{false};
+
+  // Input latency tracking, under mutex_.
+  static constexpr size_t kPendingSwaps = 8;
+  TimePoint last_input_ = {};
+  int64_t last_input_age_us_ = 0;
+  std::array<FrameLatency, kPendingSwaps> pending_swaps_ = {};
+  uint64_t pending_swap_begin_ = 0;
+  uint64_t pending_swap_end_ = 0;
+  FrameLatency cp_swap_ = {};
+  bool cp_swap_valid_ = false;
+  std::array<FrameLatency, kFrameHistory> frames_ = {};
+  std::vector<double> input_to_display_ms_;
+  std::vector<double> input_to_present_ms_;
+  std::vector<double> vdswap_to_present_ms_;
+  std::vector<double> present_to_display_ms_;
+  std::vector<double> input_age_ms_;
+#if REX_PLATFORM_WIN32
+  TimePoint qpc_origin_ = {};
+  int64_t qpc_origin_ticks_ = 0;
+  int64_t qpc_frequency_ = 0;
+#endif
 };
 
 }  // namespace

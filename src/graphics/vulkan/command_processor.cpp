@@ -5918,8 +5918,17 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
   // resources early) and specifically for frames (not to queue too many), and
   // await the availability of the current frame. Also check whether the device
   // is still available, and whether the await was successful.
-  uint64_t await_submission =
-      is_opening_frame ? closed_frame_submissions_[frame_current_ % kMaxFramesInFlight] : 0;
+  // Below kMaxFramesInFlight, gpu_max_frames_in_flight awaits a more recent
+  // frame.
+  uint64_t await_submission = 0;
+  if (is_opening_frame) {
+    const uint64_t frames_in_flight = uint64_t(
+        std::clamp(REXCVAR_GET(gpu_max_frames_in_flight), 1, int32_t(kMaxFramesInFlight)));
+    if (frame_current_ >= frames_in_flight) {
+      await_submission =
+          closed_frame_submissions_[(frame_current_ - frames_in_flight) % kMaxFramesInFlight];
+    }
+  }
   CheckSubmissionCompletionAndDeviceLoss(await_submission);
   const uint64_t completed_submission = GetCompletedSubmission();
   if (device_lost_ || completed_submission < await_submission) {

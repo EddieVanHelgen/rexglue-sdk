@@ -5,6 +5,12 @@
  * host present and host display vblank are written as CSV to
  * <exe_dir>/logs/frame_pacing.csv, so frame pacing can be measured rather
  * than guessed. Off by default; costs one branch per event when off.
+ *
+ * Input latency: the title's newest controller read before each VdSwap is
+ * carried with that frame to its first host present and, from DXGI frame
+ * statistics, to the refresh it was first shown at. Each frame gets an 'L'
+ * row at its present and a 'D' row once it's on screen, and a summary goes
+ * to the log about every 10 seconds.
  */
 
 #pragma once
@@ -27,6 +33,15 @@ enum class Event : char {
                           // d = wait field, e = us.
   kCpInterrupt = 'I',     // CP INTERRUPT packet. a = cpu mask.
   kGuestRingWait = 'G',   // Guest polled for command buffer space. a = us, b = polls.
+  kInputPoll = 'X',       // Controller state read for the title. a = device, b = age of the
+                          // host state in us (0 = read from the device just now).
+  kGpuFrameOpen = 'F',    // CP opened a frame. a = frames still in flight on the host GPU.
+  kHostDisplay = 'O',     // DXGI frame statistics. a = present count on screen, b = its QPC.
+  // Derived, written by the trace itself:
+  // 'L' a = seq, b = input read -> present us, c = VdSwap -> present us,
+  //     d = input state age us, e = input read -> VdSwap us.
+  // 'D' a = seq, b = input read -> on screen us, c = present -> on screen us,
+  //     d = VdSwap -> on screen us.
 };
 
 bool Enabled();

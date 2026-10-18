@@ -391,7 +391,10 @@ class Presenter {
     return host_vblank_grid_locked_;
   }
   // To be called at every guest vblank while pacing is active, just before it
-  // is delivered: latches the newest guest frame and has it painted.
+  // is delivered: latches the newest guest frame and has it painted. With
+  // host_vblank_late_latch_ms, if no new frame is ready yet, the one this
+  // vblank releases (titles commonly wait for the vblank to swap) is latched
+  // and painted when it arrives instead, a guest frame sooner.
   void OnGuestVblankLatch();
 
  protected:
@@ -1002,6 +1005,9 @@ class Presenter {
   uint64_t host_vblank_ready_seq_ = 0;
   uint64_t host_vblank_latched_seq_ = 0;
   uint64_t host_vblank_consumed_seq_ = 0;
+  // host_vblank_late_latch_ms: until when (steady_clock nanoseconds) a frame
+  // published after the last guest vblank is still presented for it, or 0.
+  int64_t host_vblank_late_latch_deadline_ns_ = 0;
 
   // Ordered by the Z order, and then by the time of addition.
   // Note: All the iteration logic involving this Z ordering must be the same as
