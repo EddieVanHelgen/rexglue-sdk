@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -27,6 +28,7 @@
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xthread.h>
+#include <rex/ui/frame_pacing.h>
 #include <rex/ui/graphics_provider.h>
 #include <rex/ui/window.h>
 #include <rex/ui/windowed_app_context.h>
@@ -63,6 +65,14 @@ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
 }  // namespace
 
 namespace rex::graphics {
+
+namespace {
+int64_t SteadyNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+}  // namespace
 
 // Nvidia Optimus/AMD PowerXpress support.
 // These exports force the process to trigger the discrete GPU in multi-GPU
@@ -155,6 +165,15 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
   // than delivered in a burst, and 90% of the period is slept with the rest
   // spun; elsewhere, paced to a deadline, giving up beats more than
   // kMaxVblankCatchUp late.
+  // With host_vblank_pacing, each vblank also latches the newest guest frame
+  // for presentation, and is phase-locked to the display's vblank when that
+  // is known (see Presenter::IsHostVblankPacingEnabled).
+#if REX_PLATFORM_WIN32
+  constexpr int32_t kVsyncWorkerTimerPriority = rex::thread::ThreadPriority::kLowest;
+#else
+  constexpr int32_t kVsyncWorkerTimerPriority = rex::thread::ThreadPriority::kNormal;
+#endif
+
   vsync_worker_running_ = true;
   vsync_worker_thread_ = system::object_ref<system::XHostThread>(
       new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
@@ -171,11 +190,60 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         steady_time_point next_vblank_deadline{};
         constexpr auto kMaxVblankCatchUp = std::chrono::seconds(1);
 #endif
+        const bool host_vblank_pacing =
+            presenter_ && ui::Presenter::IsHostVblankPacingEnabled();
+        int64_t last_guest_vblank_ns = 0;
         while (vsync_worker_running_) {
           if (!REXCVAR_GET(vsync)) {
             // No vsync: as many vblanks as the guest can take.
             MarkVblank();
             rex::thread::Sleep(std::chrono::milliseconds(1));
+            continue;
+          }
+          if (host_vblank_pacing) {
+            const int64_t now_ns = SteadyNowNs();
+            int64_t target_ns;
+            ui::Presenter::HostVblankGrid grid;
+            if (presenter_->GetHostVblankGrid(grid) && grid.period_ns > 0) {
+              // The host vblank about one guest period after the last guest
+              // vblank (or the next one after a stall), plus a margin so the
+              // frame latched now is presented for the host vblank after it.
+              constexpr int64_t kLatchDelayNs = 1'000'000;
+              const int64_t base_ns = grid.vblank_ns + kLatchDelayNs;
+              int64_t earliest_ns = now_ns;
+              if (last_guest_vblank_ns) {
+                earliest_ns = std::max(earliest_ns, last_guest_vblank_ns +
+                                                        int64_t(grid.divisor) * grid.period_ns -
+                                                        grid.period_ns / 2);
+              }
+              const int64_t vblanks =
+                  (earliest_ns - base_ns + grid.period_ns - 1) / grid.period_ns;
+              target_ns = base_ns + vblanks * grid.period_ns;
+            } else {
+              // Variable refresh rate (or no lock yet): evenly timed vblanks,
+              // with presents following them.
+              const int64_t period_ns = int64_t(
+                  1000000000.0 / (refresh_rate_hz * chrono::Clock::guest_time_scalar()));
+              target_ns = last_guest_vblank_ns ? last_guest_vblank_ns + period_ns : now_ns;
+              if (target_ns < now_ns - period_ns) {
+                target_ns = now_ns;  // Drop the missed beats after a stall.
+              }
+            }
+            // Sleep most of the way, spin the rest.
+            for (int64_t remaining_ns; vsync_worker_running_ &&
+                                       (remaining_ns = target_ns - SteadyNowNs()) > 0;) {
+              if (remaining_ns > 2'000'000) {
+                rex::thread::Sleep(std::chrono::microseconds((remaining_ns - 1'500'000) / 1000));
+              } else {
+                rex::thread::MaybeYield();
+              }
+            }
+            last_guest_vblank_ns = target_ns;
+            presenter_->OnGuestVblankLatch();
+            MarkVblank();
+#if REX_PLATFORM_WIN32
+            last_frame_time = chrono::Clock::QueryGuestTickCount();
+#endif
             continue;
           }
           // Real time of one vblank period at the current guest speed.
@@ -225,11 +293,12 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
   // The Windows branch spins for part of each period, which is what the lowest
   // priority is for. The deadline branch only sleeps, so there it would only
   // add wake-up latency.
-#if REX_PLATFORM_WIN32
-  vsync_worker_thread_->thread()->set_priority(rex::thread::ThreadPriority::kLowest);
-#else
-  vsync_worker_thread_->thread()->set_priority(rex::thread::ThreadPriority::kNormal);
-#endif
+  // With host vblank pacing, precise timing matters more than the CPU time of
+  // the short spin.
+  vsync_worker_thread_->thread()->set_priority(
+      presenter_ && ui::Presenter::IsHostVblankPacingEnabled()
+          ? rex::thread::ThreadPriority::kAboveNormal
+          : kVsyncWorkerTimerPriority);
 
   return X_STATUS_SUCCESS;
 }
@@ -384,6 +453,7 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
 void GraphicsSystem::MarkVblank() {
   // TODO: Enable profiling once ported
   // SCOPE_profile_cpu_f("gpu");
+  ui::frame_pacing::Record(ui::frame_pacing::Event::kGuestVblank);
 
   // Increment vblank counter (so the game sees us making progress).
   if (command_processor_) {

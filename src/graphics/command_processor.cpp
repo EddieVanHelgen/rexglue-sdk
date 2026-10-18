@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <atomic>
 #include <cinttypes>
 #include <cmath>
@@ -36,6 +37,7 @@
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
+#include <rex/ui/frame_pacing.h>
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
@@ -1072,6 +1074,7 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
 
   // generate interrupt from the command stream
   uint32_t cpu_mask = reader->ReadAndSwap<uint32_t>();
+  ui::frame_pacing::Record(ui::frame_pacing::Event::kCpInterrupt, cpu_mask);
   for (int n = 0; n < 6; n++) {
     if (cpu_mask & (1 << n)) {
       if (graphics_system_) {
@@ -1100,6 +1103,7 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   }
 #endif
   rex::perf::Profiler::Flip();
+  ui::frame_pacing::Record(ui::frame_pacing::Event::kGuestSwap);
 
   // Xenia-specific VdSwap hook.
   // VdSwap will post this to tell us we need to swap the screen/fire an
@@ -1148,6 +1152,8 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   bool is_memory = (wait_info & 0x10) != 0;
 
   bool matched = false;
+  bool waited = false;
+  const auto wait_start = std::chrono::steady_clock::now();
   do {
     uint32_t value = 0;
     if (is_memory) {
@@ -1188,6 +1194,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
+      waited = true;
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();
@@ -1212,6 +1219,13 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
     }
   } while (!matched);
+  if (waited) {
+    ui::frame_pacing::Record(ui::frame_pacing::Event::kCpWait, poll_reg_addr, ref,
+                             (uint64_t(wait_info) << 32) | mask, wait,
+                             uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                          std::chrono::steady_clock::now() - wait_start)
+                                          .count()));
+  }
 
   return true;
 }

@@ -5,6 +5,7 @@ set(REXUI_CORE_SOURCES
     graphics_upload_buffer_pool.cpp
     graphics_util.cpp
     image_decode.cpp
+    frame_pacing.cpp
     imgui_dialog.cpp
     imgui_drawer.cpp
     immediate_drawer.cpp

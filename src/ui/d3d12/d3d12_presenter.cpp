@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <cstdint>
@@ -23,6 +24,7 @@
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+#include <rex/ui/frame_pacing.h>
 #include <rex/ui/surface_win.h>
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
@@ -1162,9 +1164,39 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   // fullscreen is ever used in, the allow tearing flag must not be passed in
   // fullscreen, but DXGI fullscreen is largely unneeded with the flip
   // presentation model used in Direct3D 12).
-  HRESULT present_result = paint_context_.swap_chain->Present(
-      0, DXGI_PRESENT_RESTART |
-             (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
+  // With host vblank pacing, this is called once per guest frame right after a
+  // host vblank, so wait for the next one: every frame then reaches the screen
+  // at the same point of the refresh cycle, without tearing.
+  const bool host_vblank_paced = IsHostVblankPacingActive();
+  const bool trace_pacing = frame_pacing::Enabled();
+  const auto present_start = std::chrono::steady_clock::now();
+  HRESULT present_result =
+      host_vblank_paced
+          ? paint_context_.swap_chain->Present(1, 0)
+          : paint_context_.swap_chain->Present(
+                0, DXGI_PRESENT_RESTART | (paint_context_.swap_chain_allows_tearing
+                                               ? DXGI_PRESENT_ALLOW_TEARING
+                                               : 0));
+  if (trace_pacing) {
+    const auto present_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - present_start);
+    UINT last_present_count = 0;
+    paint_context_.swap_chain->GetLastPresentCount(&last_present_count);
+    DXGI_FRAME_STATISTICS stats = {};
+    const bool have_stats = SUCCEEDED(paint_context_.swap_chain->GetFrameStatistics(&stats));
+    HostVblankGrid grid;
+    const bool grid_locked = GetHostVblankGrid(grid);
+    frame_pacing::Record(frame_pacing::Event::kHostPresent,
+                         guest_output_resource ? guest_output_properties.frame_seq : 0,
+                         uint64_t(present_us.count()),
+                         (execute_ui_drawers ? 1 : 0) |
+                             (paint_context_.swap_chain_allows_tearing && !host_vblank_paced
+                                  ? 2
+                                  : 0) |
+                             (have_stats ? 4 : 0) | (host_vblank_paced ? 8 : 0) |
+                             (grid_locked ? 16 : 0),
+                         last_present_count, stats.PresentCount, stats.SyncRefreshCount);
+  }
   // Even if presentation has failed, work might have been enqueued anyway
   // internally before the failure according to Jesse Natalie from the DirectX
   // Discord server.

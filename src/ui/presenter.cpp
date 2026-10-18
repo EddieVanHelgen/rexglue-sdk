@@ -12,12 +12,15 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
+#include <cmath>
 #include <utility>
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#include <rex/ui/frame_pacing.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
 
@@ -28,6 +31,12 @@
 
 REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
                     "Allow presentation from non-UI thread");
+
+REXCVAR_DEFINE_BOOL(host_vblank_pacing, false, "UI/Presenter",
+                    "Drive the guest vblank from the display's vblank and present each guest "
+                    "frame once, at the next guest vblank, for even frame pacing. Needs vsync "
+                    "and a refresh rate that is a multiple of the guest's (60, 120, 240 Hz)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 // Graphics card selection, read by the Vulkan and the Direct3D 12 providers
 // (defined here because either backend may be left out of the build).
@@ -597,6 +606,26 @@ bool Presenter::RefreshGuestOutput(
     guest_output_active_last_refresh_ = false;
   }
 
+  writable_properties.frame_seq = ++guest_output_frame_seq_;
+  if (is_active) {
+    frame_pacing::Record(frame_pacing::Event::kGuestOutput, writable_properties.frame_seq);
+  }
+
+  // With host vblank pacing, the frame latched at the last guest vblank is
+  // painted shortly after it, so wait for that rather than drop it - but not
+  // for long if painting has stalled.
+  const bool host_vblank_paced = IsHostVblankPacingActive();
+  std::unique_lock<std::mutex> host_vblank_latch_lock;
+  if (host_vblank_paced) {
+    host_vblank_latch_lock = std::unique_lock<std::mutex>(host_vblank_latch_mutex_);
+    host_vblank_latch_condition_.wait_for(host_vblank_latch_lock, std::chrono::milliseconds(8),
+                                          [this]() {
+                                            return host_vblank_consumed_seq_ >=
+                                                   host_vblank_latched_seq_;
+                                          });
+    host_vblank_ready_seq_ = writable_properties.frame_seq;
+  }
+
   // Make the new image the next to present on the host (the "ready" one),
   // replacing the one already specified as the next (dropping it instead of
   // enqueueing the new image after it) to achieve the lowest latency (also,
@@ -634,9 +663,12 @@ bool Presenter::RefreshGuestOutput(
     guest_output_mailbox_writable_ = (3 - last_acquired - guest_output_mailbox_writable_) % 3;
   }
 
-  // Trigger the presentation on the host.
+  // Trigger the presentation on the host - with host vblank pacing, that's
+  // done at the next guest vblank instead.
   PaintResult paint_result = PaintResult::kNotPresented;
-  {
+  if (host_vblank_paced) {
+    host_vblank_latch_lock.unlock();
+  } else {
     std::lock_guard<std::mutex> paint_mode_mutex_lock(paint_mode_mutex_);
     switch (paint_mode_) {
       case PaintMode::kNone:
@@ -860,6 +892,13 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
   // Give the current acquired image to the caller, or UINT32_MAX if it's
   // inactive.
   const GuestOutputProperties& properties = guest_output_properties_[mailbox_index];
+  if (IsHostVblankPacingActive()) {
+    {
+      std::lock_guard<std::mutex> latch_lock(host_vblank_latch_mutex_);
+      host_vblank_consumed_seq_ = std::max(host_vblank_consumed_seq_, properties.frame_seq);
+    }
+    host_vblank_latch_condition_.notify_all();
+  }
   mailbox_index_or_max_if_inactive_out = properties.IsActive() ? mailbox_index : UINT32_MAX;
   if (properties_out) {
     *properties_out = properties;
@@ -1321,7 +1360,7 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
     // lifecycle.
     return PaintMode::kNone;
   }
-  if (!REXCVAR_GET(host_present_from_non_ui_thread)) {
+  if (!REXCVAR_GET(host_present_from_non_ui_thread) || REXCVAR_GET(host_vblank_pacing)) {
     return PaintMode::kUIThreadOnRequest;
   }
   if (surface_paint_connection_has_implicit_vsync_) {
@@ -1415,6 +1454,40 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
   if (update_paint_mode_to_desired) {
     SetPaintModeFromUIThread(GetDesiredPaintModeFromUIThread(
         surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable));
+  }
+}
+
+bool Presenter::IsHostVblankPacingEnabled() { return REXCVAR_GET(host_vblank_pacing); }
+
+bool Presenter::IsHostVblankPacingActive() const {
+  // Latches stop without vsync or while the guest isn't running.
+  const int64_t last_latch_ns = host_vblank_last_latch_ns_.load(std::memory_order_relaxed);
+  return last_latch_ns && std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                                      .count() -
+                                  last_latch_ns <
+                              int64_t(100'000'000);
+}
+
+void Presenter::OnGuestVblankLatch() {
+  host_vblank_last_latch_ns_.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count(),
+                                   std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> latch_lock(host_vblank_latch_mutex_);
+    host_vblank_latched_seq_ = host_vblank_ready_seq_;
+  }
+#if REX_PLATFORM_WIN32
+  {
+    std::lock_guard<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
+    ++dxgi_ui_tick_last_vblank_;
+  }
+  dxgi_ui_tick_signal_condition_.notify_all();
+#endif
+  std::lock_guard<std::mutex> paint_mode_lock(paint_mode_mutex_);
+  if (paint_mode_ == PaintMode::kUIThreadOnRequest) {
+    RequestPaintOrConnectionRecoveryViaWindow(false);
   }
 }
 
@@ -1642,32 +1715,149 @@ Microsoft::WRL::ComPtr<IDXGIOutput> Presenter::GetDXGIOutputForMonitor(IDXGIFact
   return nullptr;
 }
 
+namespace {
+// How many host vblanks make one guest vblank for host_vblank_pacing, or 0 if
+// the display's refresh rate isn't a whole multiple of the guest's.
+uint32_t GetHostVblankDivisor(IDXGIOutput* output, double& host_period_ns_out) {
+  DXGI_OUTPUT_DESC output_desc;
+  DEVMODEW display_mode = {};
+  display_mode.dmSize = sizeof(display_mode);
+  if (FAILED(output->GetDesc(&output_desc)) ||
+      !EnumDisplaySettingsW(output_desc.DeviceName, ENUM_CURRENT_SETTINGS, &display_mode) ||
+      display_mode.dmDisplayFrequency <= 1) {
+    REXLOG_WARN("host_vblank_pacing: can't get the display refresh rate, using the timer");
+    return 0;
+  }
+  // Integer, so 119 for 119.88 Hz - the phase lock refines the period.
+  const double host_hz = double(display_mode.dmDisplayFrequency);
+  const double guest_hz = std::clamp(REXCVAR_GET(video_mode_refresh_rate), 24.0, 480.0);
+  const long divisor = std::lround(host_hz / guest_hz);
+  if (divisor < 1 || std::abs(host_hz - divisor * guest_hz) > 1.5) {
+    REXLOG_WARN(
+        "host_vblank_pacing: {} Hz display isn't a multiple of the {} Hz guest refresh, "
+        "using the timer",
+        display_mode.dmDisplayFrequency, guest_hz);
+    return 0;
+  }
+  REXLOG_INFO("host_vblank_pacing: {} Hz display, guest vblank every {} host vblanks",
+              display_mode.dmDisplayFrequency, divisor);
+  host_period_ns_out = 1e9 / host_hz;
+  return uint32_t(divisor);
+}
+}  // namespace
+
 void Presenter::DXGIUITickThread() {
+  const bool host_vblank_pacing = REXCVAR_GET(host_vblank_pacing);
+  if (host_vblank_pacing) {
+    // Fewer late wake-ups make for a quicker, tighter phase lock.
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+  }
+  // Phase lock for host vblank pacing. WaitForVBlank wake-ups may come late,
+  // by whole refreshes under load, so they aren't counted: the phase of each
+  // one modulo the refresh period is, and the earliest in a window (the least
+  // delayed) corrects a steady clock. With variable refresh rate, the display
+  // refreshes when a frame is presented, so the vblanks mostly aren't one
+  // period apart - there's nothing to lock to then.
+  constexpr uint32_t kPhaseWindow = 32;
+  IDXGIOutput* grid_output = nullptr;
+  uint32_t vblank_divisor = 0;
+  double nominal_period_ns = 0.0;
+  double period_ns = 0.0;
+  double anchor_ns = 0.0;
+  bool phase_started = false;
+  double window_min_error_ns = 0.0;
+  uint32_t window_count = 0;
+  uint32_t window_one_period_intervals = 0;
+  double last_wake_ns = 0.0;
+  double last_correction_ns = 0.0;
+  uint32_t locked_windows = 0;
+  const auto set_grid_locked = [this](bool locked) {
+    std::lock_guard<std::mutex> grid_lock(host_vblank_grid_mutex_);
+    host_vblank_grid_locked_ = locked;
+  };
+  const auto reset_phase = [&]() {
+    phase_started = false;
+    locked_windows = 0;
+    set_grid_locked(false);
+  };
   std::unique_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
   while (true) {
     if (dxgi_ui_tick_thread_shutdown_) {
+      reset_phase();
       return;
     }
     if (!AreDXGIUITicksWaitable(dxgi_ui_tick_lock)) {
+      reset_phase();
       dxgi_ui_tick_control_condition_.wait(dxgi_ui_tick_lock);
       continue;
     }
     // Wait for vertical blank, with the mutex unlocked (holding a new reference
     // to the current output while it's happening) so subscribers can still do
     // early-out checks.
-    bool wait_succeeded;
-    {
-      Microsoft::WRL::ComPtr<IDXGIOutput> dxgi_output = dxgi_ui_tick_output_;
-      dxgi_ui_tick_lock.unlock();
-      wait_succeeded = SUCCEEDED(dxgi_ui_tick_output_->WaitForVBlank());
+    Microsoft::WRL::ComPtr<IDXGIOutput> dxgi_output = dxgi_ui_tick_output_;
+    dxgi_ui_tick_lock.unlock();
+    if (host_vblank_pacing && dxgi_output.Get() != grid_output) {
+      grid_output = dxgi_output.Get();
+      vblank_divisor = GetHostVblankDivisor(grid_output, nominal_period_ns);
+      reset_phase();
     }
+    const bool wait_succeeded = SUCCEEDED(dxgi_output->WaitForVBlank());
+
+    if (host_vblank_pacing && vblank_divisor && wait_succeeded) {
+      const double now_ns = double(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count());
+      if (!phase_started) {
+        phase_started = true;
+        period_ns = nominal_period_ns;
+        anchor_ns = now_ns;
+        last_correction_ns = now_ns;
+        window_count = 0;
+        window_one_period_intervals = 0;
+      } else {
+        if (std::abs(now_ns - last_wake_ns - period_ns) < 0.15 * period_ns) {
+          ++window_one_period_intervals;
+        }
+        const double vblanks = std::round((now_ns - anchor_ns) / period_ns);
+        const double error_ns = now_ns - (anchor_ns + vblanks * period_ns);
+        window_min_error_ns = window_count ? std::min(window_min_error_ns, error_ns) : error_ns;
+        if (++window_count >= kPhaseWindow) {
+          if (window_one_period_intervals * 2 < window_count) {
+            // Variable refresh rate (or wake-ups too unreliable to tell).
+            reset_phase();
+          } else {
+            anchor_ns += vblanks * period_ns + 0.5 * window_min_error_ns;
+            // A phase that keeps drifting the same way means the period is off.
+            const double periods = std::max(1.0, (now_ns - last_correction_ns) / period_ns);
+            period_ns = std::clamp(period_ns + 0.25 * window_min_error_ns / periods,
+                                   nominal_period_ns * 0.99, nominal_period_ns * 1.01);
+            last_correction_ns = now_ns;
+            window_count = 0;
+            window_one_period_intervals = 0;
+            locked_windows = std::min(locked_windows + 1, uint32_t(1000));
+            std::lock_guard<std::mutex> grid_lock(host_vblank_grid_mutex_);
+            host_vblank_grid_.vblank_ns = int64_t(anchor_ns);
+            host_vblank_grid_.period_ns = int64_t(period_ns);
+            host_vblank_grid_.divisor = vblank_divisor;
+            // Settled after the first few corrections.
+            host_vblank_grid_locked_ = locked_windows >= 3;
+          }
+        }
+      }
+      last_wake_ns = now_ns;
+    }
+
     dxgi_ui_tick_lock.lock();
     if (wait_succeeded) {
-      ++dxgi_ui_tick_last_vblank_;
+      // While guest vblanks latch frames, they tick instead.
+      if (!IsHostVblankPacingActive()) {
+        ++dxgi_ui_tick_last_vblank_;
+      }
     } else {
       // Lost the ability to wait for a vertical blank on this output, notify
       // the waiting threads, and wait for a new one.
       dxgi_ui_tick_output_.Reset();
+      reset_phase();
     }
     dxgi_ui_tick_signal_condition_.notify_all();
   }

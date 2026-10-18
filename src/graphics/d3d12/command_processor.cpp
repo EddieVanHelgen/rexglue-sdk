@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
@@ -30,6 +31,7 @@
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/memory/utils.h>
+#include <rex/ui/frame_pacing.h>
 #include <rex/thread/mutex.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_util.h>
@@ -3527,10 +3529,18 @@ void D3D12CommandProcessor::CheckSubmissionCompletion(uint64_t await_submission)
     await_submission = GetCurrentSubmission() - 1;
   }
 
-  if (completion_timeline_->UpdateAndGetCompletedSubmission() < await_submission) {
+  const bool gpu_behind = completion_timeline_->UpdateAndGetCompletedSubmission() < await_submission;
+  if (gpu_behind) {
     PROFILE_CMD_BUFFER_STALL();
   }
+  const auto await_start = std::chrono::steady_clock::now();
   completion_timeline_->AwaitSubmissionAndUpdateCompleted(await_submission);
+  if (gpu_behind) {
+    ui::frame_pacing::Record(ui::frame_pacing::Event::kGpuAwait,
+                             uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                          std::chrono::steady_clock::now() - await_start)
+                                          .count()));
+  }
 
   const uint64_t completed_submission = GetCompletedSubmission();
 

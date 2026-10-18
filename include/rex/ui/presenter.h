@@ -365,6 +365,35 @@ class Presenter {
   // Requests (re)painting with the UI if there's UI to draw.
   void RequestUIPaintFromUIThread();
 
+  // Host vblank pacing (host_vblank_pacing): each guest frame is presented
+  // once, latched at the guest vblank after its swap, so every frame stays on
+  // screen equally long. On a fixed refresh rate display that's a multiple of
+  // the guest's, guest vblanks are also phase-locked to the display's (every
+  // Nth one on an N times faster display); with variable refresh rate, the
+  // display follows the evenly timed presents instead.
+  static bool IsHostVblankPacingEnabled();
+  // Whether guest vblanks are currently latching frames (OnGuestVblankLatch).
+  bool IsHostVblankPacingActive() const;
+  // The display's vblank timing, phase-locked to IDXGIOutput::WaitForVBlank.
+  // Wake-ups from that may come whole refreshes late under load, so they only
+  // correct the phase of a steady clock rather than being counted. Returns
+  // false if not locked: no fixed refresh rate multiple of the guest's.
+  struct HostVblankGrid {
+    // A host vblank and the refresh period, in steady_clock nanoseconds.
+    int64_t vblank_ns;
+    int64_t period_ns;
+    // Host vblanks per guest vblank.
+    uint32_t divisor;
+  };
+  bool GetHostVblankGrid(HostVblankGrid& grid_out) const {
+    std::lock_guard<std::mutex> lock(host_vblank_grid_mutex_);
+    grid_out = host_vblank_grid_;
+    return host_vblank_grid_locked_;
+  }
+  // To be called at every guest vblank while pacing is active, just before it
+  // is delivered: latches the newest guest frame and has it painted.
+  void OnGuestVblankLatch();
+
  protected:
   enum class PaintResult {
     kPresented,
@@ -398,6 +427,8 @@ class Presenter {
     uint32_t display_aspect_ratio_x;
     uint32_t display_aspect_ratio_y;
     bool is_8bpc;
+    // Sequence number of the guest frame in this image (frame pacing trace).
+    uint64_t frame_seq = 0;
 
     GuestOutputProperties() { SetToInactive(); }
 
@@ -832,8 +863,9 @@ class Presenter {
     // There's no need to limit the frame rate manually if there is vertical
     // sync in the presentation already as that might result in inconsistent
     // frame pacing and potentially skipped vertical sync intervals.
-    return !ui_drawers_.empty() && paint_mode_ != PaintMode::kNone &&
-           !surface_paint_connection_has_implicit_vsync_;
+    // With host_vblank_pacing, the ticks also time guest output presentation.
+    return (!ui_drawers_.empty() || REXCVAR_GET(host_vblank_pacing)) &&
+           paint_mode_ != PaintMode::kNone && !surface_paint_connection_has_implicit_vsync_;
   }
   void UpdateUITicksNeededFromUIThread();
   void WaitForUITickFromUIThread();
@@ -954,6 +986,22 @@ class Presenter {
   // Accessible only by refreshing, whether the last refresh contained an image
   // rather than being blank.
   bool guest_output_active_last_refresh_ = false;
+  uint64_t guest_output_frame_seq_ = 0;
+
+  // Host vblank pacing, see IsHostVblankPacingEnabled.
+  mutable std::mutex host_vblank_grid_mutex_;
+  HostVblankGrid host_vblank_grid_ = {};
+  bool host_vblank_grid_locked_ = false;
+  // steady_clock nanoseconds of the last OnGuestVblankLatch.
+  std::atomic<int64_t> host_vblank_last_latch_ns_{0};
+  // Sequence numbers of the newest published guest frame, the one latched for
+  // presentation at the last guest vblank, and the newest painted one. A
+  // latched frame isn't replaced in the mailbox before it has been painted.
+  std::mutex host_vblank_latch_mutex_;
+  std::condition_variable host_vblank_latch_condition_;
+  uint64_t host_vblank_ready_seq_ = 0;
+  uint64_t host_vblank_latched_seq_ = 0;
+  uint64_t host_vblank_consumed_seq_ = 0;
 
   // Ordered by the Z order, and then by the time of addition.
   // Note: All the iteration logic involving this Z ordering must be the same as
