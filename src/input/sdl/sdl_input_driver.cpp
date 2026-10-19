@@ -28,7 +28,7 @@
 REXCVAR_DEFINE_STRING(hid_mappings_file, "gamecontrollerdb.txt", "Input",
                       "Path to SDL gamecontroller mappings file");
 
-REXCVAR_DEFINE_BOOL(input_poll_on_read, false, "Input",
+REXCVAR_DEFINE_BOOL(input_poll_on_read, true, "Input",
                     "SDL: read the controller every time the game asks for its state, on the "
                     "game's thread, instead of handing it the state from the last UI-thread "
                     "event pump (up to a frame old)");

@@ -32,13 +32,14 @@
 REXCVAR_DEFINE_BOOL(host_present_from_non_ui_thread, true, "UI/Presenter",
                     "Allow presentation from non-UI thread");
 
-REXCVAR_DEFINE_BOOL(host_vblank_pacing, false, "UI/Presenter",
+REXCVAR_DEFINE_BOOL(host_vblank_pacing, true, "UI/Presenter",
                     "Drive the guest vblank from the display's vblank and present each guest "
                     "frame once, at the next guest vblank, for even frame pacing. Needs vsync "
-                    "and a refresh rate that is a multiple of the guest's (60, 120, 240 Hz)")
+                    "and a refresh rate that is a multiple of the guest's (60, 120, 240 Hz); other "
+                    "rates fall back to a steady timer")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_DOUBLE(host_vblank_late_latch_ms, 0.0, "UI/Presenter",
+REXCVAR_DEFINE_DOUBLE(host_vblank_late_latch_ms, 3.0, "UI/Presenter",
                       "host_vblank_pacing: a frame that arrives up to this many ms after a guest "
                       "vblank is presented for that vblank rather than the next one, a whole "
                       "guest frame sooner. Titles that swap on the vblank deliver frames just "
