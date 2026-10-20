@@ -37,6 +37,14 @@ enum class Event : char {
                           // host state in us (0 = read from the device just now).
   kGpuFrameOpen = 'F',    // CP opened a frame. a = frames still in flight on the host GPU.
   kHostDisplay = 'O',     // DXGI frame statistics. a = present count on screen, b = its QPC.
+  kCpFrame = 'K',         // CP time per guest frame (at its XE_SWAP, since the previous one), us:
+                          // a = wall, b = idle (ring empty), c = WAIT_REG_MEM, d = blocked on the
+                          // host GPU, e = draws, f = copies (resolves). Busy = a - b - c - d.
+  kCpFrameCounts = 'k',   // Same frame: a = host submissions, b = draws skipped (pipeline not
+                          // ready), c = memexport draws.
+  kGpuFrame = 'T',        // Host GPU time per guest frame, from timestamps around each
+                          // submission's command list: a = frame, b = busy us (sum of the
+                          // submissions), c = first start -> last end us, d = submissions.
   // Derived, written by the trace itself:
   // 'L' a = seq, b = input read -> present us, c = VdSwap -> present us,
   //     d = input state age us, e = input read -> VdSwap us.

@@ -299,6 +299,9 @@ void CommandProcessor::WorkerThreadMain() {
     uint32_t write_ptr_index = write_ptr_index_.load();
     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
       SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
+      const bool trace_idle = ui::frame_pacing::Enabled();
+      const auto idle_start =
+          trace_idle ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
       // We've run out of commands to execute.
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
@@ -323,6 +326,11 @@ void CommandProcessor::WorkerThreadMain() {
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
       ReturnFromWait();
+      if (trace_idle) {
+        frame_stats_.idle_us += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                             std::chrono::steady_clock::now() - idle_start)
+                                             .count());
+      }
       if (!worker_running_ || !pending_fns_.empty()) {
         continue;
       }
@@ -1110,6 +1118,21 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
 #endif
   rex::perf::Profiler::Flip();
   ui::frame_pacing::Record(ui::frame_pacing::Event::kGuestSwap);
+  if (ui::frame_pacing::Enabled()) {
+    const auto now = std::chrono::steady_clock::now();
+    if (frame_stats_start_ != std::chrono::steady_clock::time_point{}) {
+      ui::frame_pacing::Record(
+          ui::frame_pacing::Event::kCpFrame,
+          uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(now - frame_stats_start_)
+                       .count()),
+          frame_stats_.idle_us, frame_stats_.wait_reg_us, frame_stats_.gpu_await_us,
+          frame_stats_.draws, frame_stats_.copies);
+      ui::frame_pacing::Record(ui::frame_pacing::Event::kCpFrameCounts, frame_stats_.submissions,
+                               frame_stats_.skipped_draws, frame_stats_.memexport_draws);
+    }
+    frame_stats_ = {};
+    frame_stats_start_ = now;
+  }
 
   // Xenia-specific VdSwap hook.
   // VdSwap will post this to tell us we need to swap the screen/fire an
@@ -1225,12 +1248,13 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
     }
   } while (!matched);
-  if (waited) {
-    ui::frame_pacing::Record(ui::frame_pacing::Event::kCpWait, poll_reg_addr, ref,
-                             (uint64_t(wait_info) << 32) | mask, wait,
-                             uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+  if (waited && ui::frame_pacing::Enabled()) {
+    const uint64_t wait_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
                                           std::chrono::steady_clock::now() - wait_start)
-                                          .count()));
+                                          .count());
+    frame_stats_.wait_reg_us += wait_us;
+    ui::frame_pacing::Record(ui::frame_pacing::Event::kCpWait, poll_reg_addr, ref,
+                             (uint64_t(wait_info) << 32) | mask, wait, wait_us);
   }
 
   return true;

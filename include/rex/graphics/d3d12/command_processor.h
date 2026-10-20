@@ -312,6 +312,11 @@ class D3D12CommandProcessor : public CommandProcessor {
   // the submission to await to simply check status, or pass
   // GetCurrentSubmission() to wait for all queue operations to be completed.
   void CheckSubmissionCompletion(uint64_t await_submission);
+  // frame_pacing_log 'T' rows: host GPU time per guest frame, from timestamp
+  // queries written around each submission's command list.
+  bool EnsureGpuTimestamps();
+  void ReadGpuTimestamps(uint64_t completed_submission);
+  void ShutdownGpuTimestamps();
   // If is_guest_command is true, a new full frame - with full cleanup of
   // resources and, if needed, starting capturing - is opened if pending (as
   // opposed to simply resuming after mid-frame synchronization). Returns
@@ -481,6 +486,25 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool frame_open_ = false;
   // Guest frame index, since some transient resources can be reused across
   // submissions. Values updated in the beginning of a frame.
+  static constexpr uint32_t kGpuTimestampSlots = 1024;  // submissions, 2 timestamps each
+  ID3D12QueryHeap* gpu_timestamp_heap_ = nullptr;
+  ID3D12Resource* gpu_timestamp_readback_ = nullptr;
+  const uint64_t* gpu_timestamp_mapping_ = nullptr;
+  uint64_t gpu_timestamp_frequency_ = 0;
+  bool gpu_timestamps_failed_ = false;
+  // Per slot: the submission whose timestamps it holds and that submission's
+  // guest frame.
+  uint64_t gpu_timestamp_submission_[kGpuTimestampSlots] = {};
+  uint64_t gpu_timestamp_frame_[kGpuTimestampSlots] = {};
+  uint64_t gpu_timestamp_next_read_ = 0;
+  struct GpuFrameTimes {
+    uint64_t frame = 0;
+    uint64_t busy = 0;
+    uint64_t first = 0;
+    uint64_t last = 0;
+    uint64_t submissions = 0;
+  };
+  GpuFrameTimes gpu_frame_times_;
   uint64_t frame_current_ = 1;
   uint64_t frame_completed_ = 0;
   // Submission indices of frames that have already been submitted.

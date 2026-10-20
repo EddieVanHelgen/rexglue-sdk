@@ -13,6 +13,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <deque>
 #include <functional>
@@ -529,6 +530,21 @@ class CommandProcessor {
   VIZQueryHandle viz_draw_predicate_{};
   // Segments with an unresolved VIZ consumer.
   uint32_t viz_pending_resolves_ = 0;
+
+  // frame_pacing_log 'K' / 'k' rows: where the command processor's time went
+  // during the current guest frame (command processor thread only).
+  struct FrameStats {
+    uint64_t idle_us = 0;
+    uint64_t wait_reg_us = 0;
+    uint64_t gpu_await_us = 0;
+    uint64_t draws = 0;
+    uint64_t copies = 0;
+    uint64_t skipped_draws = 0;
+    uint64_t memexport_draws = 0;
+    uint64_t submissions = 0;
+  };
+  FrameStats frame_stats_;
+  std::chrono::steady_clock::time_point frame_stats_start_{};
 
   std::atomic<bool> worker_running_;
   system::object_ref<system::XHostThread> worker_thread_;

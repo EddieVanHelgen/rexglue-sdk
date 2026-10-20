@@ -1593,6 +1593,7 @@ void D3D12CommandProcessor::ShutdownContext() {
 
   ShutdownVIZQueryResources();
 
+  ShutdownGpuTimestamps();
   ui::d3d12::util::ReleaseAndNull(readback_buffer_);
   readback_buffer_size_ = 0;
   for (auto& resolve_readback_pair : readback_buffers_) {
@@ -2498,6 +2499,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
     return IssueCopy();
   }
+  ++frame_stats_.draws;
 
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
 
@@ -2675,6 +2677,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     if (pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
       // Pipeline not ready (still being created asynchronously) - skip the
       // draw.
+      ++frame_stats_.skipped_draws;
       OnVIZSurveyDraw(false);
       return true;
     }
@@ -3043,6 +3046,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (memexport_used) {
     // Make sure this memexporting draw is ordered with other work using shared
     // memory as a UAV.
+    ++frame_stats_.memexport_draws;
     // TODO(Triang3l): Find some PM4 command that can be used for indication of
     // when memexports should be awaited?
     shared_memory_->MarkUAVWritesCommitNeeded();
@@ -3230,6 +3234,7 @@ bool D3D12CommandProcessor::IssueCopy() {
   if (!BeginSubmission(true)) {
     return false;
   }
+  ++frame_stats_.copies;
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
   if (readback_mode == ReadbackResolveMode::kDisabled) {
     uint32_t written_address, written_length;
@@ -3535,14 +3540,18 @@ void D3D12CommandProcessor::CheckSubmissionCompletion(uint64_t await_submission)
   }
   const auto await_start = std::chrono::steady_clock::now();
   completion_timeline_->AwaitSubmissionAndUpdateCompleted(await_submission);
-  if (gpu_behind) {
-    ui::frame_pacing::Record(ui::frame_pacing::Event::kGpuAwait,
-                             uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
-                                          std::chrono::steady_clock::now() - await_start)
-                                          .count()));
+  if (gpu_behind && ui::frame_pacing::Enabled()) {
+    const uint64_t await_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                           std::chrono::steady_clock::now() - await_start)
+                                           .count());
+    frame_stats_.gpu_await_us += await_us;
+    ui::frame_pacing::Record(ui::frame_pacing::Event::kGpuAwait, await_us);
   }
 
   const uint64_t completed_submission = GetCompletedSubmission();
+  if (gpu_timestamp_mapping_) {
+    ReadGpuTimestamps(completed_submission);
+  }
 
   // Reclaim command allocators.
   while (command_allocator_submitted_first_) {
@@ -3839,7 +3848,24 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
         command_allocator_writable_first_->command_allocator;
     command_allocator->Reset();
     command_list_->Reset(command_allocator, nullptr);
+    const uint64_t submission = GetCurrentSubmission();
+    const uint32_t timestamp_slot = uint32_t(submission % kGpuTimestampSlots);
+    const bool gpu_timestamps = ui::frame_pacing::Enabled() && EnsureGpuTimestamps();
+    if (gpu_timestamps) {
+      command_list_->EndQuery(gpu_timestamp_heap_, D3D12_QUERY_TYPE_TIMESTAMP,
+                              timestamp_slot * 2);
+    }
     deferred_command_list_.Execute(command_list_, command_list_1_, command_list_2_);
+    if (gpu_timestamps) {
+      command_list_->EndQuery(gpu_timestamp_heap_, D3D12_QUERY_TYPE_TIMESTAMP,
+                              timestamp_slot * 2 + 1);
+      command_list_->ResolveQueryData(gpu_timestamp_heap_, D3D12_QUERY_TYPE_TIMESTAMP,
+                                      timestamp_slot * 2, 2, gpu_timestamp_readback_,
+                                      uint64_t(timestamp_slot) * 16);
+      gpu_timestamp_submission_[timestamp_slot] = submission;
+      gpu_timestamp_frame_[timestamp_slot] = frame_current_;
+    }
+    ++frame_stats_.submissions;
     command_list_->Close();
     ID3D12CommandList* execute_command_lists[] = {command_list_};
     direct_queue->ExecuteCommandLists(1, execute_command_lists);
@@ -5349,6 +5375,91 @@ ID3D12Resource* D3D12CommandProcessor::RequestReadbackBuffer(uint32_t size) {
     readback_buffer_size_ = size;
   }
   return readback_buffer_;
+}
+
+bool D3D12CommandProcessor::EnsureGpuTimestamps() {
+  if (gpu_timestamp_mapping_) {
+    return true;
+  }
+  if (gpu_timestamps_failed_) {
+    return false;
+  }
+  gpu_timestamps_failed_ = true;
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  if (FAILED(provider.GetDirectQueue()->GetTimestampFrequency(&gpu_timestamp_frequency_)) ||
+      !gpu_timestamp_frequency_) {
+    REXGPU_WARN("frame_pacing_log: no GPU timestamp frequency, no 'T' rows");
+    return false;
+  }
+  D3D12_QUERY_HEAP_DESC heap_desc = {};
+  heap_desc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+  heap_desc.Count = kGpuTimestampSlots * 2;
+  if (FAILED(device->CreateQueryHeap(&heap_desc, IID_PPV_ARGS(&gpu_timestamp_heap_)))) {
+    REXGPU_WARN("frame_pacing_log: couldn't create the GPU timestamp heap, no 'T' rows");
+    return false;
+  }
+  D3D12_RESOURCE_DESC buffer_desc;
+  ui::d3d12::util::FillBufferResourceDesc(buffer_desc, kGpuTimestampSlots * 16,
+                                          D3D12_RESOURCE_FLAG_NONE);
+  void* mapping = nullptr;
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesReadback, provider.GetHeapFlagCreateNotZeroed(),
+          &buffer_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+          IID_PPV_ARGS(&gpu_timestamp_readback_))) ||
+      FAILED(gpu_timestamp_readback_->Map(0, nullptr, &mapping))) {
+    REXGPU_WARN("frame_pacing_log: couldn't create the GPU timestamp readback, no 'T' rows");
+    ShutdownGpuTimestamps();
+    return false;
+  }
+  gpu_timestamp_mapping_ = static_cast<const uint64_t*>(mapping);
+  gpu_timestamp_next_read_ = GetCurrentSubmission();
+  gpu_frame_times_ = {};
+  gpu_timestamps_failed_ = false;
+  return true;
+}
+
+void D3D12CommandProcessor::ReadGpuTimestamps(uint64_t completed_submission) {
+  if (completed_submission >= gpu_timestamp_next_read_ + kGpuTimestampSlots) {
+    // Fell behind further than the slots reach (shouldn't happen).
+    gpu_timestamp_next_read_ = completed_submission + 1 - kGpuTimestampSlots;
+    gpu_frame_times_ = {};
+  }
+  const double us_per_tick = 1000000.0 / double(gpu_timestamp_frequency_);
+  for (; gpu_timestamp_next_read_ <= completed_submission; ++gpu_timestamp_next_read_) {
+    const uint64_t submission = gpu_timestamp_next_read_;
+    const uint32_t slot = uint32_t(submission % kGpuTimestampSlots);
+    if (gpu_timestamp_submission_[slot] != submission) {
+      continue;  // Written with the trace off.
+    }
+    const uint64_t start = gpu_timestamp_mapping_[slot * 2];
+    const uint64_t end = gpu_timestamp_mapping_[slot * 2 + 1];
+    const uint64_t frame = gpu_timestamp_frame_[slot];
+    GpuFrameTimes& times = gpu_frame_times_;
+    if (times.submissions && times.frame != frame) {
+      ui::frame_pacing::Record(ui::frame_pacing::Event::kGpuFrame, times.frame,
+                               uint64_t(double(times.busy) * us_per_tick),
+                               uint64_t(double(times.last - times.first) * us_per_tick),
+                               times.submissions);
+      times = {};
+    }
+    if (!times.submissions) {
+      times.frame = frame;
+      times.first = start;
+    }
+    times.busy += end > start ? end - start : 0;
+    times.last = std::max(times.last, end);
+    ++times.submissions;
+  }
+}
+
+void D3D12CommandProcessor::ShutdownGpuTimestamps() {
+  if (gpu_timestamp_readback_ && gpu_timestamp_mapping_) {
+    gpu_timestamp_readback_->Unmap(0, nullptr);
+  }
+  gpu_timestamp_mapping_ = nullptr;
+  ui::d3d12::util::ReleaseAndNull(gpu_timestamp_readback_);
+  ui::d3d12::util::ReleaseAndNull(gpu_timestamp_heap_);
 }
 
 void D3D12CommandProcessor::EnsureQueryResources() {
