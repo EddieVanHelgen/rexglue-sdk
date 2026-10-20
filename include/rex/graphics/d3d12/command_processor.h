@@ -374,7 +374,9 @@ class D3D12CommandProcessor : public CommandProcessor {
       int32_t window_offset_tiles);
   bool UpdateBindings(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
                       ID3D12RootSignature* root_signature, bool shared_memory_is_uav);
-  bool IssueCopy_ReadbackResolvePath();
+  // only_requested: readback_resolve is off; read back only a resolve into a
+  // range registered with rex::graphics::resolve_readback (synchronously).
+  bool IssueCopy_ReadbackResolvePath(bool only_requested = false);
   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
 

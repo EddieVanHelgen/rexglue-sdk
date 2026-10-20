@@ -31,6 +31,7 @@
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/memory/utils.h>
+#include <rex/graphics/resolve_readback.h>
 #include <rex/ui/frame_pacing.h>
 #include <rex/thread/mutex.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
@@ -3237,6 +3238,9 @@ bool D3D12CommandProcessor::IssueCopy() {
   ++frame_stats_.copies;
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
   if (readback_mode == ReadbackResolveMode::kDisabled) {
+    if (resolve_readback::Any()) {
+      return IssueCopy_ReadbackResolvePath(true);
+    }
     uint32_t written_address, written_length;
     return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
                                          written_address, written_length);
@@ -3244,7 +3248,7 @@ bool D3D12CommandProcessor::IssueCopy() {
   return IssueCopy_ReadbackResolvePath();
 }
 
-bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
+bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath(bool only_requested) {
   uint32_t written_address, written_length;
   reg::RB_COPY_DEST_INFO copy_dest_info;
   bool is_scaled;
@@ -3253,6 +3257,12 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     return false;
   }
   if (!written_length) {
+    return true;
+  }
+  // A resolve into a range the title asked for is read back synchronously,
+  // whatever readback_resolve says (rex/graphics/resolve_readback.h).
+  const bool requested = resolve_readback::Overlaps(written_address, written_length);
+  if (only_requested && !requested) {
     return true;
   }
 
@@ -3473,8 +3483,8 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   }
 
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
-  bool use_delayed_sync =
-      readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome;
+  bool use_delayed_sync = !requested && (readback_mode == ReadbackResolveMode::kFast ||
+                                         readback_mode == ReadbackResolveMode::kSome);
   uint32_t read_index = write_index;
   if (use_delayed_sync) {
     read_index = 1 - write_index;
@@ -3494,7 +3504,8 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
     }
   }
 
-  bool should_copy = (readback_mode == ReadbackResolveMode::kSome) ? is_cache_miss : true;
+  bool should_copy =
+      (readback_mode == ReadbackResolveMode::kSome && !requested) ? is_cache_miss : true;
   if (should_copy && rb.buffers[read_index] && readback_length <= rb.sizes[read_index] &&
       rb.mapped_data[read_index]) {
     uint8_t* destination = memory_->TranslatePhysical(written_address);
