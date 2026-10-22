@@ -157,4 +157,40 @@ inline void sequential_6_BE_to_interleaved_2_LE(float* output, const float* inpu
 }
 #endif
 
+// Soft limiter for a fold driven above its normal level: linear up to
+// `knee`, then a tanh curve that approaches but never reaches full scale, so
+// peaks round off instead of clipping. Non-finite input goes to silence, as
+// in clamp_unit.
+inline float soft_limit(float v, float knee = 0.8f) {
+  if (!std::isfinite(v)) {
+    return 0.0f;
+  }
+  const float magnitude = std::fabs(v);
+  if (magnitude <= knee) {
+    return v;
+  }
+  const float headroom = 1.0f - knee;
+  return std::copysign(knee + headroom * std::tanh((magnitude - knee) / headroom), v);
+}
+
+// The stereo fold with a soft limiter instead of the hard clamp, for output
+// gains above the fold's normalised level (audio_stereo_fold_gain_db). Scalar
+// on purpose: it only runs when that gain is set.
+inline void sequential_6_BE_to_interleaved_2_LE_limited(float* output, const float* input,
+                                                        size_t ch_sample_count,
+                                                        const StereoFold& fold, float gain) {
+  const float scale = fold.scale * gain;
+  for (size_t sample = 0; sample < ch_sample_count; sample++) {
+    const float fl = rex::byte_swap(input[0 * ch_sample_count + sample]);
+    const float fr = rex::byte_swap(input[1 * ch_sample_count + sample]);
+    const float fc = rex::byte_swap(input[2 * ch_sample_count + sample]);
+    const float lf = rex::byte_swap(input[3 * ch_sample_count + sample]);
+    const float bl = rex::byte_swap(input[4 * ch_sample_count + sample]);
+    const float br = rex::byte_swap(input[5 * ch_sample_count + sample]);
+    const float mid = fc * fold.center + lf * fold.lfe;
+    output[sample * 2] = soft_limit((fl + mid + bl * fold.surround) * scale);
+    output[sample * 2 + 1] = soft_limit((fr + mid + br * fold.surround) * scale);
+  }
+}
+
 }  // namespace rex::audio::conversion

@@ -25,6 +25,11 @@
 #include <SDL3/SDL.h>
 
 REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+REXCVAR_DEFINE_DOUBLE(audio_stereo_fold_gain_db, 0.0, "Audio",
+                      "Extra gain in dB on the 5.1 -> stereo fold, which is normalised to 0.586 "
+                      "(-4.6 dB) so it can't clip. +4.6 undoes that, to match a console's stereo "
+                      "level; a soft limiter then rounds off the peaks. 0 = the normalised fold "
+                      "(default). Stereo devices only; -12 to +12");
 
 namespace rex::audio::sdl {
 
@@ -178,6 +183,8 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
   const StereoFold fold = GetStereoFold();
   const SurroundMix mix = GetSurroundMix();
   const float gain = GetOutputGain();
+  const double fold_gain_db = std::clamp(REXCVAR_GET(audio_stereo_fold_gain_db), -12.0, 12.0);
+  const float fold_gain = static_cast<float>(std::pow(10.0, fold_gain_db / 20.0));
   while (additional_amount > 0) {
     static uint32_t sdl_callback_count = 0;
     std::unique_lock<std::mutex> guard(driver->frames_mutex_);
@@ -200,8 +207,13 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
       } else {
         switch (driver->sdl_device_channels_) {
           case 2:
-            conversion::sequential_6_BE_to_interleaved_2_LE(data, buffer, channel_samples_, fold,
-                                                            gain);
+            if (fold_gain_db != 0.0) {
+              conversion::sequential_6_BE_to_interleaved_2_LE_limited(data, buffer, channel_samples_,
+                                                                      fold, gain * fold_gain);
+            } else {
+              conversion::sequential_6_BE_to_interleaved_2_LE(data, buffer, channel_samples_, fold,
+                                                              gain);
+            }
             break;
           case 6:
             conversion::sequential_6_BE_to_interleaved_6_LE(data, buffer, channel_samples_, mix,
