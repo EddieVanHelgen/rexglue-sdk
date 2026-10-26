@@ -180,7 +180,10 @@ class D3D12Presenter final : public Presenter {
       // guest_output_intermediate_texture_paint_last_usage_.
       kRTVIndexGuestOutputIntermediate0 = kRTVIndexSwapChainBuffer0 + kSwapChainBufferCount,
 
-      kRTVCount = kRTVIndexGuestOutputIntermediate0 + kGuestOutputMailboxSize - 1,
+      // One RTV per intermediate texture (guest_output_intermediate_textures has kMaxGuestOutputPaintEffects - 1
+      // entries, like the view heap below); sizing this by the mailbox size left intermediates 2..4 outside the heap,
+      // and an FSR upscale of more than two passes then wrote RTVs past its end (driver access violation).
+      kRTVCount = kRTVIndexGuestOutputIntermediate0 + kMaxGuestOutputPaintEffects - 1,
     };
 
     enum ViewIndex : UINT {
