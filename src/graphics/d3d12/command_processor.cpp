@@ -2096,6 +2096,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // Swap counter for same-frame captures (Presenter::RequestGuestOutputCapture, PDZ stage 1 auto-diff).
   static std::atomic<uint64_t> issue_swap_count{0};
   const uint64_t swap_index = ++issue_swap_count;
+  resolve_readback::NoteSwap(swap_index);
   const bool capture_this_swap = ui::Presenter::RequestedGuestOutputCapture() == swap_index;
   if (ui::Presenter::IsGuestOutputExternal() && !capture_this_swap) {
     // A native renderer in the title owns the window output for this frame (PDZ stage 1): skip the
@@ -3264,7 +3265,7 @@ bool D3D12CommandProcessor::IssueCopy() {
   ++frame_stats_.copies;
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
   if (readback_mode == ReadbackResolveMode::kDisabled) {
-    if (resolve_readback::Any()) {
+    if (resolve_readback::Any() || resolve_readback::DumpingFrame()) {
       return IssueCopy_ReadbackResolvePath(true);
     }
     uint32_t written_address, written_length;
@@ -3288,7 +3289,9 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath(bool only_requested) {
   // A resolve into a range the title asked for is read back synchronously,
   // whatever readback_resolve says (rex/graphics/resolve_readback.h).
   const bool requested = resolve_readback::Overlaps(written_address, written_length);
-  if (only_requested && !requested) {
+  // A native renderer's pass dump reads back every resolve of the armed frame (resolve_readback.h).
+  const bool dump = resolve_readback::DumpingFrame();
+  if (only_requested && !requested && !dump) {
     return true;
   }
 
@@ -3509,7 +3512,7 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath(bool only_requested) {
   }
 
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
-  bool use_delayed_sync = !requested && (readback_mode == ReadbackResolveMode::kFast ||
+  bool use_delayed_sync = !requested && !dump && (readback_mode == ReadbackResolveMode::kFast ||
                                          readback_mode == ReadbackResolveMode::kSome);
   uint32_t read_index = write_index;
   if (use_delayed_sync) {
@@ -3532,6 +3535,16 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath(bool only_requested) {
 
   bool should_copy =
       (readback_mode == ReadbackResolveMode::kSome && !requested) ? is_cache_miss : true;
+  if (dump && rb.buffers[read_index] && readback_length <= rb.sizes[read_index] &&
+      rb.mapped_data[read_index]) {
+    resolve_readback::ObserveDump(written_address, readback_length,
+                                  static_cast<const uint8_t*>(rb.mapped_data[read_index]),
+                                  copy_dest_info.value);
+    // Only the dump asked for this one: leave guest memory as it would have been.
+    if (only_requested && !requested) {
+      should_copy = false;
+    }
+  }
   if (should_copy && rb.buffers[read_index] && readback_length <= rb.sizes[read_index] &&
       rb.mapped_data[read_index]) {
     uint8_t* destination = memory_->TranslatePhysical(written_address);

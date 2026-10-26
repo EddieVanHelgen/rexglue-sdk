@@ -35,4 +35,20 @@ bool Any();
 // True if [address, address + length) overlaps a registered range.
 bool Overlaps(uint32_t address, uint32_t length);
 
+// Pass dump (a native renderer's per-pass comparison): every resolve the GPU
+// processes in the frame that ends with guest swap `swap` (the GPU plugin's
+// IssueSwap count, 1-based) is read back synchronously and handed to the
+// observer on the GPU thread (address and length of the written extent, the
+// 1x data, RB_COPY_DEST_INFO). Guest memory is only written for ranges added
+// with Add. swap 0 disarms.
+using DumpObserver = void (*)(uint32_t address, uint32_t length, const uint8_t* data,
+                              uint32_t copy_dest_info);
+void ArmDump(uint64_t swap, DumpObserver observer);
+// IssueSwap: the swap just issued (its 1-based index).
+void NoteSwap(uint64_t swap);
+// True while the GPU processes the armed frame (cheap).
+bool DumpingFrame();
+// Hands one resolve to the observer (when DumpingFrame).
+void ObserveDump(uint32_t address, uint32_t length, const uint8_t* data, uint32_t copy_dest_info);
+
 }  // namespace rex::graphics::resolve_readback
