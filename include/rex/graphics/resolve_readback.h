@@ -51,4 +51,18 @@ bool DumpingFrame();
 // Hands one resolve to the observer (when DumpingFrame).
 void ObserveDump(uint32_t address, uint32_t length, const uint8_t* data, uint32_t copy_dest_info);
 
+// Per-draw companion of the dump (same armed frame): every draw the GPU
+// processes is reported with its primitive type, index count, the vertex
+// shader's ucode hash and the vertex shader float constants c0..c63
+// (registers 0x4000.., 256 dwords) as the register file holds them.
+using DrawObserver = void (*)(uint32_t primitive_type, uint32_t index_count, uint64_t vs_hash,
+                              const uint32_t* vs_constants_256);
+void SetDrawObserver(DrawObserver observer);
+// The indirect buffer (PM4 INDIRECT_BUFFER, e.g. a D3D precompiled command buffer) the GPU is executing, 0 for
+// the primary ring; set by the command processor, read by draw observers.
+void SetCurrentIndirect(uint32_t guest_address);
+uint32_t CurrentIndirect();
+void ObserveDraw(uint32_t primitive_type, uint32_t index_count, uint64_t vs_hash,
+                 const uint32_t* vs_constants_256);
+
 }  // namespace rex::graphics::resolve_readback

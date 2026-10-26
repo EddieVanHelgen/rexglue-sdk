@@ -2532,6 +2532,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
   ++frame_stats_.draws;
 
+  // A native renderer's pass dump: this draw's primitive, count, VS hash and VS c0..c63 (resolve_readback.h).
+  if (resolve_readback::DumpingFrame()) {
+    const Shader* dump_vs = active_vertex_shader();
+    resolve_readback::ObserveDraw(uint32_t(primitive_type), index_count,
+                                  dump_vs ? dump_vs->ucode_data_hash() : 0,
+                                  &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X]);
+  }
+
   bool surface_pitch_is_zero = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch == 0;
 
   // Vertex shader analysis.

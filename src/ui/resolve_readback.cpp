@@ -70,6 +70,33 @@ bool DumpingFrame() {
          g_dump_observer.load(std::memory_order_relaxed);
 }
 
+namespace {
+std::atomic<DrawObserver> g_draw_observer{nullptr};
+}  // namespace
+
+namespace {
+std::atomic<uint32_t> g_current_indirect{0};
+}  // namespace
+
+void SetCurrentIndirect(uint32_t guest_address) {
+  g_current_indirect.store(guest_address, std::memory_order_relaxed);
+}
+
+uint32_t CurrentIndirect() {
+  return g_current_indirect.load(std::memory_order_relaxed);
+}
+
+void SetDrawObserver(DrawObserver observer) {
+  g_draw_observer = observer;
+}
+
+void ObserveDraw(uint32_t primitive_type, uint32_t index_count, uint64_t vs_hash,
+                 const uint32_t* vs_constants_256) {
+  if (DrawObserver observer = g_draw_observer.load()) {
+    observer(primitive_type, index_count, vs_hash, vs_constants_256);
+  }
+}
+
 void ObserveDump(uint32_t address, uint32_t length, const uint8_t* data, uint32_t copy_dest_info) {
   if (DumpObserver observer = g_dump_observer.load()) {
     observer(address, length, data, copy_dest_info);

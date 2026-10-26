@@ -28,6 +28,7 @@
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/texture/info.h>
+#include <rex/graphics/resolve_readback.h>
 #include <rex/graphics/sampler_info.h>
 #include <rex/graphics/xenos.h>
 #include <rex/logging.h>
@@ -794,6 +795,13 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
 
 void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
+  // For a native renderer's pass dump: which indirect buffer the draws inside come from.
+  const uint32_t outer_indirect = graphics::resolve_readback::CurrentIndirect();
+  graphics::resolve_readback::SetCurrentIndirect(ptr);
+  struct RestoreIndirect {
+    uint32_t value;
+    ~RestoreIndirect() { graphics::resolve_readback::SetCurrentIndirect(value); }
+  } restore_indirect{outer_indirect};
 
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
