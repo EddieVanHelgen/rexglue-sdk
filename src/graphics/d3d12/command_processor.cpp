@@ -2093,7 +2093,11 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
 
-  if (ui::Presenter::IsGuestOutputExternal()) {
+  // Swap counter for same-frame captures (Presenter::RequestGuestOutputCapture, PDZ stage 1 auto-diff).
+  static std::atomic<uint64_t> issue_swap_count{0};
+  const uint64_t swap_index = ++issue_swap_count;
+  const bool capture_this_swap = ui::Presenter::RequestedGuestOutputCapture() == swap_index;
+  if (ui::Presenter::IsGuestOutputExternal() && !capture_this_swap) {
     // A native renderer in the title owns the window output for this frame (PDZ stage 1): skip the
     // plugin's swap post-processing and refresh entirely instead of racing it on the presenter.
     static bool logged_skip = false;
@@ -2102,6 +2106,9 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       REXGPU_INFO("IssueSwap: guest output owned externally; the plugin's presenter refresh is skipped");
     }
     return;
+  }
+  if (capture_this_swap) {
+    ui::Presenter::SetGuestOutputCaptureBypass(true);
   }
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
@@ -2465,6 +2472,15 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         EndSubmission(true);
         return true;
       });
+  if (capture_this_swap) {
+    ui::Presenter::SetGuestOutputCaptureBypass(false);
+    ui::RawImage capture_image;
+    if (presenter->CaptureGuestOutput(capture_image)) {
+      ui::Presenter::StoreGuestOutputCapture(swap_index, std::move(capture_image));
+    } else {
+      ui::Presenter::StoreGuestOutputCapture(swap_index, ui::RawImage());
+    }
+  }
 
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.

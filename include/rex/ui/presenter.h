@@ -357,6 +357,16 @@ class Presenter {
   // title executable only links exported functions.)
   static void SetGuestOutputExternalOwner(bool external);
   static bool IsGuestOutputExternal();
+  // Same-frame capture for a native renderer's auto-diff (PDZ stage 1): the title asks for the guest output of
+  // swap `swap_index` (counted from 1 by the GPU plugin's IssueSwap); the plugin refreshes that swap even while
+  // the output is owned externally, captures it right after its own refresh and stores it here for the title to
+  // take. One request at a time; 0 = none.
+  static void RequestGuestOutputCapture(uint64_t swap_index);
+  static uint64_t RequestedGuestOutputCapture();
+  static void StoreGuestOutputCapture(uint64_t swap_index, RawImage&& image);
+  static bool TakeGuestOutputCapture(uint64_t& swap_index, RawImage& image_out);
+  // Thread-local: lets this thread refresh the guest output while it is owned externally (capture swap only).
+  static void SetGuestOutputCaptureBypass(bool bypass);
   // The implementation must be callable from any thread, including from
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.

@@ -595,13 +595,51 @@ bool Presenter::IsGuestOutputExternal() {
   return guest_output_external_owner_.load(std::memory_order_acquire) != std::thread::id();
 }
 
+namespace {
+std::atomic<uint64_t> guest_output_capture_request_{0};
+std::mutex guest_output_capture_mutex_;
+uint64_t guest_output_capture_index_ = 0;
+RawImage guest_output_capture_image_;
+thread_local bool guest_output_capture_bypass_ = false;
+}  // namespace
+
+void Presenter::RequestGuestOutputCapture(uint64_t swap_index) {
+  guest_output_capture_request_.store(swap_index, std::memory_order_release);
+}
+
+uint64_t Presenter::RequestedGuestOutputCapture() {
+  return guest_output_capture_request_.load(std::memory_order_acquire);
+}
+
+void Presenter::StoreGuestOutputCapture(uint64_t swap_index, RawImage&& image) {
+  std::lock_guard<std::mutex> lock(guest_output_capture_mutex_);
+  guest_output_capture_index_ = swap_index;
+  guest_output_capture_image_ = std::move(image);
+  uint64_t expected = swap_index;
+  guest_output_capture_request_.compare_exchange_strong(expected, 0);
+}
+
+bool Presenter::TakeGuestOutputCapture(uint64_t& swap_index, RawImage& image_out) {
+  std::lock_guard<std::mutex> lock(guest_output_capture_mutex_);
+  if (!guest_output_capture_index_) {
+    return false;
+  }
+  swap_index = guest_output_capture_index_;
+  image_out = std::move(guest_output_capture_image_);
+  guest_output_capture_index_ = 0;
+  guest_output_capture_image_ = RawImage();
+  return true;
+}
+
+void Presenter::SetGuestOutputCaptureBypass(bool bypass) { guest_output_capture_bypass_ = bypass; }
+
 bool Presenter::RefreshGuestOutput(
     uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
     uint32_t display_aspect_ratio_y,
     std::function<bool(GuestOutputRefreshContext& context)> refresher) {
   {
     const std::thread::id owner = guest_output_external_owner_.load(std::memory_order_acquire);
-    if (owner != std::thread::id() && owner != std::this_thread::get_id()) {
+    if (owner != std::thread::id() && owner != std::this_thread::get_id() && !guest_output_capture_bypass_) {
       return false;  // an external renderer owns the guest output (see presenter.h)
     }
   }
