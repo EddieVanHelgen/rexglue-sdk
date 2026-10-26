@@ -2110,6 +2110,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
       logged_skip = true;
       REXGPU_INFO("IssueSwap: guest output owned externally; the plugin's presenter refresh is skipped");
     }
+    // Still end the frame, as the normal path does below ("to prevent leaking per-frame resources"): without it the
+    // upload buffer pool and the other per-frame resources were never reclaimed while the native output was shown
+    // (about 2 MB of D3D upload buffer per frame until allocations failed: PDZ soak run, log 194).
+    EndSubmission(true);
     return;
   }
   if (capture_this_swap) {
