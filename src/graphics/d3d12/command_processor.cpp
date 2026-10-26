@@ -2093,6 +2093,16 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   uint32_t display_width = std::max(uint32_t(1), uint32_t(video_mode.display_width));
   uint32_t display_height = std::max(uint32_t(1), uint32_t(video_mode.display_height));
 
+  if (ui::Presenter::IsGuestOutputExternal()) {
+    // A native renderer in the title owns the window output for this frame (PDZ stage 1): skip the
+    // plugin's swap post-processing and refresh entirely instead of racing it on the presenter.
+    static bool logged_skip = false;
+    if (!logged_skip) {
+      logged_skip = true;
+      REXGPU_INFO("IssueSwap: guest output owned externally; the plugin's presenter refresh is skipped");
+    }
+    return;
+  }
   presenter->RefreshGuestOutput(
       guest_output_width, guest_output_height, display_width, display_height,
       [this, &swap_texture_srv_desc, frontbuffer_format, swap_texture_resource, guest_output_width,
