@@ -328,6 +328,18 @@ class Trace {
 
 }  // namespace
 
+namespace {
+
+// GetTotals: written by the command processor thread (the only writer of 'K' and 'T' rows).
+struct TotalsCounters {
+  std::atomic<uint64_t> cp_frames{0}, cp_wall_us{0}, cp_idle_us{0}, cp_wait_reg_us{0},
+      cp_gpu_await_us{0};
+  std::atomic<uint64_t> gpu_frames{0}, gpu_busy_us{0}, gpu_submissions{0};
+};
+TotalsCounters g_totals;
+
+}  // namespace
+
 bool Enabled() {
   return REXCVAR_GET(frame_pacing_log);
 }
@@ -337,7 +349,29 @@ void Record(Event event, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_
   if (!Enabled()) {
     return;
   }
+  if (event == Event::kCpFrame) {
+    g_totals.cp_frames.fetch_add(1, std::memory_order_relaxed);
+    g_totals.cp_wall_us.fetch_add(a, std::memory_order_relaxed);
+    g_totals.cp_idle_us.fetch_add(b, std::memory_order_relaxed);
+    g_totals.cp_wait_reg_us.fetch_add(c, std::memory_order_relaxed);
+    g_totals.cp_gpu_await_us.fetch_add(d, std::memory_order_relaxed);
+  } else if (event == Event::kGpuFrame) {
+    g_totals.gpu_frames.fetch_add(1, std::memory_order_relaxed);
+    g_totals.gpu_busy_us.fetch_add(b, std::memory_order_relaxed);
+    g_totals.gpu_submissions.fetch_add(d, std::memory_order_relaxed);
+  }
   Trace::Get().Record(event, a, b, c, d, e, f);
+}
+
+void GetTotals(Totals& out) {
+  out.cp_frames = g_totals.cp_frames.load(std::memory_order_relaxed);
+  out.cp_wall_us = g_totals.cp_wall_us.load(std::memory_order_relaxed);
+  out.cp_idle_us = g_totals.cp_idle_us.load(std::memory_order_relaxed);
+  out.cp_wait_reg_us = g_totals.cp_wait_reg_us.load(std::memory_order_relaxed);
+  out.cp_gpu_await_us = g_totals.cp_gpu_await_us.load(std::memory_order_relaxed);
+  out.gpu_frames = g_totals.gpu_frames.load(std::memory_order_relaxed);
+  out.gpu_busy_us = g_totals.gpu_busy_us.load(std::memory_order_relaxed);
+  out.gpu_submissions = g_totals.gpu_submissions.load(std::memory_order_relaxed);
 }
 
 }  // namespace rex::ui::frame_pacing

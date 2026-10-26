@@ -57,4 +57,20 @@ bool Enabled();
 void Record(Event event, uint64_t a = 0, uint64_t b = 0, uint64_t c = 0, uint64_t d = 0,
             uint64_t e = 0, uint64_t f = 0);
 
+// Running totals of the per-frame rows, summed while the trace is on (frame_pacing_log), so a
+// title can report the command processor's time and the host GPU time per frame without parsing
+// the CSV: 'K' rows (kCpFrame) and 'T' rows (kGpuFrame). Monotonic; any thread. All zero while
+// the trace has been off.
+struct Totals {
+  uint64_t cp_frames = 0;        // 'K' rows
+  uint64_t cp_wall_us = 0;       // 'K' a
+  uint64_t cp_idle_us = 0;       // 'K' b
+  uint64_t cp_wait_reg_us = 0;   // 'K' c
+  uint64_t cp_gpu_await_us = 0;  // 'K' d
+  uint64_t gpu_frames = 0;       // 'T' rows
+  uint64_t gpu_busy_us = 0;      // 'T' b
+  uint64_t gpu_submissions = 0;  // 'T' d
+};
+void GetTotals(Totals& out);
+
 }  // namespace rex::ui::frame_pacing

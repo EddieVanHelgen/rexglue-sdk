@@ -18,6 +18,7 @@ set(REXGPU_XENOS_SOURCES
     # GPU system
     graphics_system.cpp
     command_processor.cpp
+    null_command_processor.cpp
     util/draw_extent_estimator.cpp
     util/draw.cpp
     util/smaa_textures.cpp
@@ -85,6 +86,7 @@ if(REXGLUE_USE_D3D12)
         d3d12/deferred_command_list.cpp
         d3d12/pipeline_cache.cpp
         d3d12/query_pool.cpp
+        d3d12/null_graphics_system.cpp
     )
 endif()
 

@@ -16,6 +16,7 @@
 
 #if REX_HAS_D3D12
 #include <rex/graphics/d3d12/graphics_system.h>
+#include <rex/graphics/d3d12/null_graphics_system.h>
 #endif
 #if REX_HAS_VULKAN
 #include <rex/graphics/vulkan/graphics_system.h>
@@ -41,6 +42,12 @@ extern "C" REX_GPU_PLUGIN_EXPORT rex::system::IGraphicsSystem* rex_gpu_create(
 #if REX_HAS_D3D12
   if (backend == "any" || backend == "d3d12") {
     return new rex::graphics::d3d12::D3D12GraphicsSystem();
+  }
+  // No GPU emulation: the D3D12 provider and presenter for a renderer in the title, the ring and
+  // its synchronisation serviced, no draws (rex/graphics/d3d12/null_graphics_system.h). Only on
+  // request ("any" never selects it).
+  if (backend == "null") {
+    return new rex::graphics::d3d12::D3D12NullGraphicsSystem();
   }
 #endif
 #if REX_HAS_VULKAN

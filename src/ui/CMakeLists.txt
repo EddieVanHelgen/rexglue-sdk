@@ -9,6 +9,7 @@ set(REXUI_CORE_SOURCES
     resolve_readback.cpp
     gamma_mirror.cpp
     gpu_census.cpp
+    null_gpu.cpp
     imgui_dialog.cpp
     imgui_drawer.cpp
     immediate_drawer.cpp

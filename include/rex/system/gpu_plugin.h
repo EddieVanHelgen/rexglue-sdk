@@ -36,7 +36,8 @@ inline constexpr const char* kGpuAbiVersionSymbol = "rex_gpu_abi_version";
 
 struct GpuCreateInfo {
   uint32_t struct_size = 0;       // sizeof(GpuCreateInfo), set by the host
-  const char* backend = nullptr;  // "d3d12", "vulkan", or "any"
+  const char* backend = nullptr;  // "d3d12", "vulkan", "any", or "null" (rexgpu-xenos: D3D12
+                                  // provider and presenter, no GPU emulation; rex/graphics/null_gpu.h)
 };
 
 // extern "C" exports every GPU plugin must provide:
