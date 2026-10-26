@@ -15,8 +15,13 @@
 #include <rex/graphics/registers.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
+#include <rex/platform.h>
 #include <rex/system/xmemory.h>
 #include <rex/ui/presenter.h>
+
+#if REX_PLATFORM_WIN32
+#include <windows.h>
+#endif
 
 namespace rex::graphics::d3d12 {
 
@@ -42,6 +47,32 @@ constexpr uint64_t kRepeatMs = 5000;
 
 uint32_t Volatile32(const uint32_t& value) {
   return *reinterpret_cast<const volatile uint32_t*>(&value);
+}
+
+// The monitor reads guest memory off the command processor thread: a block the guest freed is
+// protected no-access in the physical heap, and an access violation there is not handled (it would
+// end the process). Readable = committed and not no-access / guard (Windows); elsewhere the
+// memory part of the line is left out.
+bool HostRangeReadable(const void* host, size_t length) {
+#if REX_PLATFORM_WIN32
+  const uint8_t* p = static_cast<const uint8_t*>(host);
+  const uint8_t* end = p + length;
+  while (p < end) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(p, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT ||
+        (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
+        !(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) {
+      return false;
+    }
+    p = static_cast<const uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+  }
+  return true;
+#else
+  (void)host;
+  (void)length;
+  return false;
+#endif
 }
 
 }  // namespace
@@ -163,11 +194,15 @@ std::string D3D12NullGraphicsSystem::SyncState() {
     // clears its bit), +4 the presentation-interval gate (the vblank handler stores 0), +16 / +20
     // the callback and its context.
     const uint8_t* block = memory_->TranslatePhysical(scratch_address);
-    s += fmt::format(" | scratch block in memory: +0 {:08X}, +4 {:08X}, +16 {:08X}, +20 {:08X}",
-                     rex::memory::load_and_swap<uint32_t>(block),
-                     rex::memory::load_and_swap<uint32_t>(block + 4),
-                     rex::memory::load_and_swap<uint32_t>(block + 16),
-                     rex::memory::load_and_swap<uint32_t>(block + 20));
+    if (HostRangeReadable(block, 24)) {
+      s += fmt::format(" | scratch block in memory: +0 {:08X}, +4 {:08X}, +16 {:08X}, +20 {:08X}",
+                       rex::memory::load_and_swap<uint32_t>(block),
+                       rex::memory::load_and_swap<uint32_t>(block + 4),
+                       rex::memory::load_and_swap<uint32_t>(block + 16),
+                       rex::memory::load_and_swap<uint32_t>(block + 20));
+    } else {
+      s += " | scratch block in memory: not readable (freed, or a device switch)";
+    }
   }
   s += fmt::format(" | COHER_STATUS_HOST {:08X} | interrupt callback {:08X} data {:08X}{}",
                    reg(XE_GPU_REG_COHER_STATUS_HOST), Volatile32(interrupt_callback_),
@@ -267,12 +302,17 @@ void D3D12NullGraphicsSystem::MonitorThreadMain() {
     } else if (t_ms - burst_change_ms >= kRingStallMs &&
                (!ring_reported_ms || t_ms - ring_reported_ms >= kRepeatMs)) {
       ring_reported_ms = t_ms;
+      // Not necessarily a hang: the CP also sleeps for seconds on a poll the CPU releases only after
+      // a long task (the resource-lock wait during a level load). A hang shows the guest side too
+      // (the title's pdz_sync STALL lines: a fence block or no Swap).
       REXGPU_WARN(
-          "null_gpu: STALL: ring work pending and no burst finished for {} ms ({}) | {}",
+          "null_gpu: STALL (possible; a hang only with pdz_sync STALL lines beside it): ring work "
+          "pending and no burst finished for {} ms ({}) | {}",
           t_ms - burst_change_ms,
           s.reg_waits != reg_waits_at_burst
-              ? "WAIT_REG_MEM sleeps keep repeating: a memory or register poll that never matches "
-                "(see the scratch block)"
+              ? "WAIT_REG_MEM sleeps keep repeating: a memory or register poll not matched yet, "
+                "e.g. one the CPU releases after a long task (level load), or never (see the "
+                "scratch block)"
               : "no vblank-paced sleep: a short-wait WAIT_REG_MEM spin or a packet that does not "
                 "return",
           cp_state(s, now_us, ring_work));
