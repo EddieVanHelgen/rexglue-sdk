@@ -31,6 +31,7 @@
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/memory/utils.h>
+#include <rex/graphics/gamma_mirror.h>
 #include <rex/graphics/resolve_readback.h>
 #include <rex/ui/frame_pacing.h>
 #include <rex/thread/mutex.h>
@@ -2097,6 +2098,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   static std::atomic<uint64_t> issue_swap_count{0};
   const uint64_t swap_index = ++issue_swap_count;
   resolve_readback::NoteSwap(swap_index);
+  // The table the plugin applies, for a renderer in the title (rex/graphics/gamma_mirror.h).
+  gamma_mirror::Publish(reinterpret_cast<const uint32_t*>(gamma_ramp_256_entry_table()));
   const bool capture_this_swap = ui::Presenter::RequestedGuestOutputCapture() == swap_index;
   if (ui::Presenter::IsGuestOutputExternal() && !capture_this_swap) {
     // A native renderer in the title owns the window output for this frame (PDZ stage 1): skip the

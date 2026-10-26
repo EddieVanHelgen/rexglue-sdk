@@ -7,6 +7,7 @@ set(REXUI_CORE_SOURCES
     image_decode.cpp
     frame_pacing.cpp
     resolve_readback.cpp
+    gamma_mirror.cpp
     imgui_dialog.cpp
     imgui_drawer.cpp
     immediate_drawer.cpp
