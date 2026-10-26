@@ -349,6 +349,14 @@ class Presenter {
   bool RefreshGuestOutput(uint32_t frontbuffer_width, uint32_t frontbuffer_height,
                           uint32_t display_aspect_ratio_x, uint32_t display_aspect_ratio_y,
                           std::function<bool(GuestOutputRefreshContext& context)> refresher);
+  // External guest output (a native renderer in the title, PDZ stage 1): while set, only
+  // RefreshGuestOutput calls from the owning thread are honoured; calls from other threads
+  // (the GPU plugin's swap) return false without touching the mailbox, so two producers never
+  // refresh the same presenter at once (2026-10-26: a concurrent refresh crashed the driver).
+  // (Defined in presenter.cpp, not inline: the static member lives in rexruntime.dll and the
+  // title executable only links exported functions.)
+  static void SetGuestOutputExternalOwner(bool external);
+  static bool IsGuestOutputExternal();
   // The implementation must be callable from any thread, including from
   // multiple at the same time, and it should acquire the latest guest output
   // image via ConsumeGuestOutput.
@@ -695,6 +703,7 @@ class Presenter {
   // than 8 bits of precision per channel (though the image provided by the
   // refresher may still have a higher storage precision) - if not written, it
   // will be assumed to be false.
+  static std::atomic<std::thread::id> guest_output_external_owner_;
   virtual bool RefreshGuestOutputImpl(
       uint32_t mailbox_index, uint32_t frontbuffer_width, uint32_t frontbuffer_height,
       std::function<bool(GuestOutputRefreshContext& context)> refresher, bool& is_8bpc_out_ref) = 0;

@@ -584,10 +584,27 @@ void Presenter::PaintFromUIThread(bool force_paint) {
   }
 }
 
+std::atomic<std::thread::id> Presenter::guest_output_external_owner_{};
+
+void Presenter::SetGuestOutputExternalOwner(bool external) {
+  guest_output_external_owner_.store(external ? std::this_thread::get_id() : std::thread::id(),
+                                     std::memory_order_release);
+}
+
+bool Presenter::IsGuestOutputExternal() {
+  return guest_output_external_owner_.load(std::memory_order_acquire) != std::thread::id();
+}
+
 bool Presenter::RefreshGuestOutput(
     uint32_t frontbuffer_width, uint32_t frontbuffer_height, uint32_t display_aspect_ratio_x,
     uint32_t display_aspect_ratio_y,
     std::function<bool(GuestOutputRefreshContext& context)> refresher) {
+  {
+    const std::thread::id owner = guest_output_external_owner_.load(std::memory_order_acquire);
+    if (owner != std::thread::id() && owner != std::this_thread::get_id()) {
+      return false;  // an external renderer owns the guest output (see presenter.h)
+    }
+  }
   GuestOutputProperties& writable_properties =
       guest_output_properties_[guest_output_mailbox_writable_];
   writable_properties.frontbuffer_width = frontbuffer_width;
