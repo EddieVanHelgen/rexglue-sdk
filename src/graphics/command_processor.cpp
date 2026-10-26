@@ -25,6 +25,7 @@
 #include <rex/chrono/clock.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/gpu_census.h>
 #include <rex/graphics/graphics_system.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/pipeline/texture/info.h>
@@ -145,6 +146,20 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
     return ReadbackResolveMode::kFull;
   }
   return ReadbackResolveMode::kDisabled;
+}
+
+// GPU census (rex/graphics/gpu_census.h): the switch is read once per ring burst (ExecutePrimaryBuffer), so
+// while it is off a packet costs one relaxed load of this flag and nothing else. The indirect-buffer depth
+// tells a packet's source (primary ring or indirect buffer). Command processor thread.
+std::atomic<bool> census_on{false};
+uint32_t census_indirect_depth = 0;
+
+inline bool CensusOn() {
+  return census_on.load(std::memory_order_relaxed);
+}
+
+inline uint32_t CensusSource() {
+  return census_indirect_depth ? gpu_census::kIndirect : gpu_census::kPrimary;
 }
 
 }  // namespace
@@ -346,6 +361,13 @@ void CommandProcessor::WorkerThreadMain() {
     if (read_ptr_writeback_ptr_) {
       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
                                        read_ptr_index_);
+      if (CensusOn()) {
+        gpu_census::Add(gpu_census::Get().rptr_writes);
+        if (gpu_census::Row* row =
+                gpu_census::CountRow(gpu_census::RowKind::kRptrWrite, read_ptr_writeback_ptr_)) {
+          row->last0.store(read_ptr_index_, std::memory_order_relaxed);
+        }
+      }
     }
 
     // FIXME: We're supposed to process the WAIT_UNTIL register at this point,
@@ -485,6 +507,10 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   if (!known_registers.IsKnown(index)) {
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
+  const bool census = CensusOn();
+  if (census && index < gpu_census::kCountedRegisters) {
+    gpu_census::Add(gpu_census::Get().register_writes[index]);
+  }
 
   // Scratch register writeback.
   if (index >= XE_GPU_REG_SCRATCH_REG0 && index <= XE_GPU_REG_SCRATCH_REG7) {
@@ -494,6 +520,13 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       uint32_t scratch_addr = regs.values[XE_GPU_REG_SCRATCH_ADDR];
       uint32_t mem_addr = scratch_addr + (scratch_reg * 4);
       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(mem_addr), value);
+      if (census) {
+        gpu_census::Add(gpu_census::Get().scratch_writes);
+        if (gpu_census::Row* row =
+                gpu_census::CountRow(gpu_census::RowKind::kScratchWrite, mem_addr, scratch_reg)) {
+          row->last0.store(value, std::memory_order_relaxed);
+        }
+      }
     }
   } else {
     switch (index) {
@@ -502,6 +535,9 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       // and allow us to synchronize the memory.
       case XE_GPU_REG_COHER_STATUS_HOST: {
         const_cast<volatile uint32_t&>(regs.values[index]) |= UINT32_C(0x80000000);
+        if (census) {
+          gpu_census::Add(gpu_census::Get().coherency_requests);
+        }
       } break;
 
       case XE_GPU_REG_DC_LUT_RW_INDEX: {
@@ -544,6 +580,9 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
         }
         if (write_gamma_ramp_component) {
           OnGammaRamp256EntryTableValueWritten();
+          if (census) {
+            gpu_census::Add(gpu_census::Get().gamma_256_writes);
+          }
         }
       } break;
 
@@ -579,6 +618,9 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
         }
         if (write_gamma_ramp_component) {
           OnGammaRampPWLValueWritten();
+          if (census) {
+            gpu_census::Add(gpu_census::Get().gamma_pwl_writes);
+          }
         }
       } break;
 
@@ -612,6 +654,9 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
                       rex::memory::Reinterpret<uint32_t>(new_gamma_ramp_rw_index));
         if (gamma_ramp_write_enable_mask) {
           OnGammaRamp256EntryTableValueWritten();
+          if (census) {
+            gpu_census::Add(gpu_census::Get().gamma_256_writes);
+          }
         }
       } break;
     }
@@ -717,6 +762,9 @@ void CommandProcessor::MakeCoherent() {
   if (!status_host.status) {
     return;
   }
+  if (CensusOn()) {
+    gpu_census::Add(gpu_census::Get().coherency_flushes);
+  }
 
   const char* action = "N/A";
   if (status_host.vc_action_ena && status_host.tc_action_ena) {
@@ -748,6 +796,19 @@ void CommandProcessor::ReturnFromWait() {}
 
 uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index) {
   SCOPE_profile_cpu_f("gpu");
+
+  // GPU census switch, read once per burst (rex/graphics/gpu_census.h).
+  const bool census = gpu_census::Enabled();
+  census_on.store(census, std::memory_order_relaxed);
+  census_indirect_depth = 0;
+  if (census) {
+    gpu_census::Census& c = gpu_census::Get();
+    gpu_census::Add(c.bursts);
+    const uint32_t ring_dwords = primary_buffer_size_ / uint32_t(sizeof(uint32_t));
+    gpu_census::Add(c.burst_dwords, write_index >= read_index
+                                        ? write_index - read_index
+                                        : write_index + ring_dwords - read_index);
+  }
 
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
@@ -783,6 +844,14 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
         std::atomic_thread_fence(std::memory_order_release);
         memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(writeback_ptr),
                                          uint32_t(reader.read_offset() / sizeof(uint32_t)));
+        if (census) {
+          gpu_census::Add(gpu_census::Get().rptr_writes);
+          if (gpu_census::Row* row =
+                  gpu_census::CountRow(gpu_census::RowKind::kRptrWrite, writeback_ptr)) {
+            row->last0.store(uint32_t(reader.read_offset() / sizeof(uint32_t)),
+                             std::memory_order_relaxed);
+          }
+        }
       }
       remaining_at_writeback = remaining;
     }
@@ -802,6 +871,29 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
     uint32_t value;
     ~RestoreIndirect() { graphics::resolve_readback::SetCurrentIndirect(value); }
   } restore_indirect{outer_indirect};
+  // GPU census: packets from here on come from an indirect buffer.
+  struct CensusDepth {
+    bool counted;
+    explicit CensusDepth(bool on) : counted(on) {
+      if (counted) {
+        gpu_census::Census& c = gpu_census::Get();
+        ++census_indirect_depth;
+        if (c.indirect_max_depth.load(std::memory_order_relaxed) < census_indirect_depth) {
+          c.indirect_max_depth.store(census_indirect_depth, std::memory_order_relaxed);
+        }
+      }
+    }
+    ~CensusDepth() {
+      if (counted && census_indirect_depth) {
+        --census_indirect_depth;
+      }
+    }
+  } census_depth{CensusOn()};
+  if (census_depth.counted) {
+    gpu_census::Census& c = gpu_census::Get();
+    gpu_census::Add(c.indirect_buffers);
+    gpu_census::Add(c.indirect_dwords, count);
+  }
 
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
@@ -833,6 +925,9 @@ bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
   const uint32_t packet = reader->ReadAndSwap<uint32_t>();
   const uint32_t packet_type = packet >> 30;
   if (packet == 0) {
+    if (CensusOn()) {
+      gpu_census::Add(gpu_census::Get().zero_headers);
+    }
     return true;
   }
 
@@ -869,6 +964,23 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
 
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
+  if (CensusOn()) {
+    // By source, by the range of the first register, and the dwords split over the ranges they land in.
+    gpu_census::Census& c = gpu_census::Get();
+    gpu_census::Add(c.type0_packets[CensusSource()]);
+    gpu_census::Add(c.type0_range_packets[gpu_census::RangeOf(base_index)]);
+    if (write_one_reg) {
+      gpu_census::Add(c.type0_single_register_packets);
+      gpu_census::Add(c.type0_range_dwords[gpu_census::RangeOf(base_index)], count);
+    } else {
+      for (uint32_t index = base_index, left = count; left;) {
+        const uint32_t run = std::min(left, gpu_census::RangeEnd(index) - index);
+        gpu_census::Add(c.type0_range_dwords[gpu_census::RangeOf(index)], run);
+        index += run;
+        left -= run;
+      }
+    }
+  }
   if (!write_one_reg) {
     // Consecutive registers: as a range, so the backend can take the constant
     // blocks (most of these packets) in one go rather than one virtual
@@ -889,6 +1001,9 @@ bool CommandProcessor::ExecutePacketType1(memory::RingBuffer* reader, uint32_t p
   // Contains two registers of data. Type-0 should be more common.
   uint32_t reg_index_1 = packet & 0x7FF;
   uint32_t reg_index_2 = (packet >> 11) & 0x7FF;
+  if (CensusOn()) {
+    gpu_census::Add(gpu_census::Get().type1_packets[CensusSource()]);
+  }
   uint32_t reg_data_1 = reader->ReadAndSwap<uint32_t>();
   uint32_t reg_data_2 = reader->ReadAndSwap<uint32_t>();
   WriteRegister(reg_index_1, reg_data_1);
@@ -899,6 +1014,9 @@ bool CommandProcessor::ExecutePacketType1(memory::RingBuffer* reader, uint32_t p
 bool CommandProcessor::ExecutePacketType2(memory::RingBuffer* reader, uint32_t packet) {
   // Type-2 packet.
   // No-op. Do nothing.
+  if (CensusOn()) {
+    gpu_census::Add(gpu_census::Get().type2_packets[CensusSource()]);
+  }
   return true;
 }
 
@@ -912,6 +1030,18 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     REXGPU_ERROR("ExecutePacketType3 overflow (read count {:08X}, packet count {:08X})",
                  reader->read_count(), count * sizeof(uint32_t));
     return false;
+  }
+
+  if (CensusOn()) {
+    gpu_census::Census& c = gpu_census::Get();
+    gpu_census::Add(c.type3_packets[opcode][CensusSource()]);
+    gpu_census::Add(c.type3_dwords[opcode], count);
+    if (packet & 1) {
+      gpu_census::Add(c.type3_predicated[opcode]);
+      if ((bin_select_ & bin_mask_) == 0 || opcode == PM4_XE_SWAP) {
+        gpu_census::Add(c.type3_skipped[opcode]);
+      }
+    }
   }
 
   // & 1 == predicate - when set, we do bin check to see if we should execute
@@ -1062,6 +1192,9 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     default:
       REXGPU_INFO("Unimplemented GPU OPCODE: 0x{:02X}\t\tCOUNT: {}\n", opcode, count);
       assert_always();
+      if (CensusOn()) {
+        gpu_census::Add(gpu_census::Get().type3_unhandled[opcode]);
+      }
       reader->AdvanceRead(count * sizeof(uint32_t));
       break;
   }
@@ -1097,6 +1230,14 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
   // generate interrupt from the command stream
   uint32_t cpu_mask = reader->ReadAndSwap<uint32_t>();
   ui::frame_pacing::Record(ui::frame_pacing::Event::kCpInterrupt, cpu_mask);
+  if (CensusOn()) {
+    gpu_census::Census& c = gpu_census::Get();
+    for (int n = 0; n < 6; n++) {
+      if (cpu_mask & (1 << n)) {
+        gpu_census::Add(c.interrupt_packets[n]);
+      }
+    }
+  }
   for (int n = 0; n < 6; n++) {
     if (cpu_mask & (1 << n)) {
       if (graphics_system_) {
@@ -1154,6 +1295,17 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_width = reader->ReadAndSwap<uint32_t>();
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
+
+  if (CensusOn()) {
+    // The front buffer and its format (fetch constant 0, as IssueSwap reads it: the gamma table follows it).
+    gpu_census::Add(gpu_census::Get().xe_swaps);
+    const uint32_t format = uint32_t(register_file_->GetTextureFetch(0).format);
+    if (gpu_census::Row* row =
+            gpu_census::CountRow(gpu_census::RowKind::kSwap, frontbuffer_ptr, format)) {
+      row->last0.store(frontbuffer_width, std::memory_order_relaxed);
+      row->last1.store(frontbuffer_height, std::memory_order_relaxed);
+    }
+  }
 
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 
@@ -1264,6 +1416,32 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
     ui::frame_pacing::Record(ui::frame_pacing::Event::kCpWait, poll_reg_addr, ref,
                              (uint64_t(wait_info) << 32) | mask, wait, wait_us);
   }
+  if (CensusOn()) {
+    // By poll target (memory address or register) and function, with the time waited.
+    gpu_census::Census& c = gpu_census::Get();
+    gpu_census::Add(c.wait_reg_mem);
+    uint64_t wait_us = 0;
+    if (waited) {
+      wait_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - wait_start)
+                             .count());
+      gpu_census::Add(c.wait_reg_mem_waited);
+      gpu_census::Add(c.wait_reg_mem_us, wait_us);
+      if (wait >= 0x100) {
+        gpu_census::Add(c.wait_reg_mem_paced);
+      }
+    }
+    const uint32_t target = is_memory ? (poll_reg_addr & ~uint32_t(0x3)) : poll_reg_addr;
+    if (gpu_census::Row* row = gpu_census::CountRow(gpu_census::RowKind::kWaitRegMem, target,
+                                                    wait_info & 0x17, wait_us)) {
+      if (waited) {
+        row->aux.fetch_add(1, std::memory_order_relaxed);
+        gpu_census::MaxShared(row->max, wait_us);
+      }
+      row->last0.store(ref, std::memory_order_relaxed);
+      row->last1.store(mask, std::memory_order_relaxed);
+    }
+  }
 
   return true;
 }
@@ -1275,6 +1453,9 @@ bool CommandProcessor::ExecutePacketType3_REG_RMW(memory::RingBuffer* reader, ui
   uint32_t rmw_info = reader->ReadAndSwap<uint32_t>();
   uint32_t and_mask = reader->ReadAndSwap<uint32_t>();
   uint32_t or_mask = reader->ReadAndSwap<uint32_t>();
+  if (CensusOn()) {
+    gpu_census::CountRow(gpu_census::RowKind::kRegRmw, rmw_info & 0x1FFF);
+  }
   uint32_t value = register_file_->values[rmw_info & 0x1FFF];
   if ((rmw_info >> 31) & 0x1) {
     // & reg
@@ -1306,6 +1487,12 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
 
   auto endianness = static_cast<xenos::Endian>(mem_addr & 0x3);
   mem_addr &= ~0x3;
+  if (CensusOn()) {
+    if (gpu_census::Row* row =
+            gpu_census::CountRow(gpu_census::RowKind::kRegToMem, mem_addr, reg_addr)) {
+      row->last0.store(reg_val, std::memory_order_relaxed);
+    }
+  }
   reg_val = GpuSwap(reg_val, endianness);
   memory::store(memory_->TranslatePhysical(mem_addr), reg_val);
 
@@ -1315,8 +1502,16 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
 bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, uint32_t packet,
                                                     uint32_t count) {
   uint32_t write_addr = reader->ReadAndSwap<uint32_t>();
+  const bool census = CensusOn();
+  gpu_census::Row* census_row =
+      census ? gpu_census::CountRow(gpu_census::RowKind::kMemWrite, write_addr & ~uint32_t(0x3), 0,
+                                    count - 1)
+             : nullptr;
   for (uint32_t i = 0; i < count - 1; i++) {
     uint32_t write_data = reader->ReadAndSwap<uint32_t>();
+    if (census_row && i == 0) {
+      census_row->last0.store(write_data, std::memory_order_relaxed);
+    }
 
     auto endianness = static_cast<xenos::Endian>(write_addr & 0x3);
     auto addr = write_addr & ~0x3;
@@ -1375,6 +1570,18 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
       matched = true;
       break;
   }
+  if (CensusOn()) {
+    const uint32_t target =
+        (wait_info & 0x100) ? (write_reg_addr & ~uint32_t(0x3)) : write_reg_addr;
+    if (gpu_census::Row* row =
+            gpu_census::CountRow(gpu_census::RowKind::kCondWrite, target, wait_info & 0x117)) {
+      if (matched) {
+        row->aux.fetch_add(1, std::memory_order_relaxed);
+      }
+      row->last0.store(poll_reg_addr, std::memory_order_relaxed);
+      row->last1.store(ref, std::memory_order_relaxed);
+    }
+  }
   if (matched) {
     // Write.
     if (wait_info & 0x100) {
@@ -1397,6 +1604,14 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE(memory::RingBuffer* reader
   uint32_t initiator = reader->ReadAndSwap<uint32_t>();
   // Writeback initiator.
   WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
+  if (CensusOn()) {
+    if (gpu_census::Row* row =
+            gpu_census::CountRow(gpu_census::RowKind::kEventWrite, 0, initiator & 0x3F)) {
+      if (count > 1) {
+        row->aux.fetch_add(1, std::memory_order_relaxed);
+      }
+    }
+  }
   if (count == 1) {
     // Just an event flag? Where does this write?
   } else {
@@ -1426,6 +1641,14 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   }
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
+  if (CensusOn()) {
+    // Fences: the address, the event and whether the vblank counter is written.
+    if (gpu_census::Row* row = gpu_census::CountRow(
+            gpu_census::RowKind::kEventWriteShd, address,
+            (initiator & 0x3F) | (((initiator >> 31) & 0x1) << 7))) {
+      row->last0.store(data_value, std::memory_order_relaxed);
+    }
+  }
   data_value = GpuSwap(data_value, endianness);
   memory::store(memory_->TranslatePhysical(address), data_value);
   return true;
@@ -1440,6 +1663,9 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* re
   WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, initiator & 0x3F);
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
+  if (CensusOn()) {
+    gpu_census::CountRow(gpu_census::RowKind::kEventWriteExt, address, initiator & 0x3F);
+  }
 
   // Let us hope we can fake this.
   // This callback tells the driver the xy coordinates affected by a previous
@@ -1469,11 +1695,22 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* re
   uint32_t report_address = register_file_->values[XE_GPU_REG_RB_SAMPLE_COUNT_ADDR];
   // RB_SAMPLE_COUNT_CTL is unused by real hardware.
 
+  const bool census = CensusOn();
+  if (census) {
+    gpu_census::CountRow(gpu_census::RowKind::kEventWriteZpd, report_address, initiator & 0x3F);
+    if (report_address) {
+      gpu_census::Add(gpu_census::Get().zpd_events);
+    }
+  }
+
   if (!report_address) {
     return true;
   }
 
   if (zpd_mode_ != ZPDMode::kFake && !zpd_force_fake_fallback_) {
+    if (census) {
+      gpu_census::Add(gpu_census::Get().zpd_reports_queued);
+    }
     // Z-Pass Done (ZPD) facilitates all D3D occlusion queries.
     // D3D fills the counters (usually ZPass_A + ZPass_B, but some 2005-2006 D3D
     // versions use ZFail_A + ZFail_B, and sometimes even both counters' B
@@ -1585,6 +1822,65 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
   // we don't support yet.
   reader->AdvanceRead(count_remaining * sizeof(uint32_t));
 
+  const bool census = CensusOn();
+  if (census) {
+    // Draws by source, primitive, index source, EDRAM mode (copy = a resolve), and the features a renderer
+    // replacing the backend has to provide (32-bit indices, primitive reset, VIZ predication, tessellation,
+    // explicit major mode, MSAA).
+    gpu_census::Census& c = gpu_census::Get();
+    const uint32_t* regs = register_file_->values;
+    const uint32_t prim = uint32_t(vgt_draw_initiator.prim_type);
+    const uint32_t source_select = uint32_t(vgt_draw_initiator.source_select);
+    gpu_census::Add(c.draws[CensusSource()]);
+    gpu_census::Add(c.draw_primitive[prim & 63]);
+    gpu_census::Add(c.draw_source_select[source_select & 3]);
+    gpu_census::Add(c.draw_indices, vgt_draw_initiator.num_indices);
+    const uint32_t edram_mode = regs[XE_GPU_REG_RB_MODECONTROL] & 0x7;
+    gpu_census::Add(c.draw_edram_mode[edram_mode]);
+    if (edram_mode == uint32_t(xenos::EdramMode::kCopy)) {
+      const uint32_t copy_control = regs[XE_GPU_REG_RB_COPY_CONTROL];
+      gpu_census::Add(c.resolves);
+      if (copy_control & 0x100) {
+        gpu_census::Add(c.resolve_color_clear);
+      }
+      if (copy_control & 0x200) {
+        gpu_census::Add(c.resolve_depth_clear);
+      }
+      if ((copy_control & 0x7) >= 4) {
+        gpu_census::Add(c.resolve_depth_source);
+      }
+      const uint32_t resolve_key = ((regs[XE_GPU_REG_RB_COPY_DEST_INFO] >> 7) & 0x3F) |
+                                   ((copy_control & 0x7) << 8) | ((copy_control & 0x300) << 4);
+      if (gpu_census::Row* row = gpu_census::CountRow(gpu_census::RowKind::kResolve, resolve_key)) {
+        row->last0.store(regs[XE_GPU_REG_RB_COPY_DEST_BASE], std::memory_order_relaxed);
+      }
+    } else {
+      gpu_census::Add(c.draw_msaa[(regs[XE_GPU_REG_RB_SURFACE_INFO] >> 16) & 0x3]);
+    }
+    if (vgt_draw_initiator.source_select == xenos::SourceSelect::kDMA) {
+      if (vgt_draw_initiator.index_size == xenos::IndexFormat::kInt32) {
+        gpu_census::Add(c.draw_index32);
+      }
+      if (regs[XE_GPU_REG_PA_SU_SC_MODE_CNTL] & (UINT32_C(1) << 21)) {
+        gpu_census::Add(c.draw_primitive_reset);
+      }
+    }
+    if (viz_query_condition & 0x100) {
+      gpu_census::Add(c.draw_viz_conditional);
+    }
+    if ((regs[XE_GPU_REG_VGT_OUTPUT_PATH_CNTL] & 0x3) ==
+        uint32_t(xenos::VGTOutputPath::kTessellationEnable)) {
+      gpu_census::Add(c.draw_tessellated);
+    }
+    if (xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type)) {
+      gpu_census::Add(c.draw_explicit_major);
+    }
+    if (vgt_draw_initiator.prim_type == xenos::PrimitiveType::kPointList &&
+        vgt_draw_initiator.num_indices == 1) {
+      gpu_census::Add(c.draw_single_point);
+    }
+  }
+
   if (draw_succeeded) {
     // A consumer draw whose survey is still outstanding runs under the
     // backend's predicate instead of blocking. Surveys themselves are
@@ -1613,6 +1909,9 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
 
   if (!draw_succeeded) {
     OnVIZSurveyDraw(false);
+    if (census) {
+      gpu_census::Add(gpu_census::Get().draw_failed);
+    }
   }
 
   // If read the packed correctly, but merely couldn't execute it (because of,
@@ -1656,6 +1955,11 @@ bool CommandProcessor::ExecutePacketType3_SET_CONSTANT(memory::RingBuffer* reade
   uint32_t index = offset_type & 0x7FF;
   uint32_t type = (offset_type >> 16) & 0xFF;
   uint32_t count_registers = count - 1;
+  if (CensusOn()) {
+    gpu_census::Census& c = gpu_census::Get();
+    gpu_census::Add(c.set_constant[std::min(type, uint32_t(5))][0]);
+    gpu_census::Add(c.set_constant[std::min(type, uint32_t(5))][1], count_registers);
+  }
   switch (type) {
     case 0:  // ALU
       WriteALURangeFromRing(reader, index, count_registers);
@@ -1684,6 +1988,11 @@ bool CommandProcessor::ExecutePacketType3_SET_CONSTANT2(memory::RingBuffer* read
                                                         uint32_t count) {
   uint32_t offset_type = reader->ReadAndSwap<uint32_t>();
   uint32_t index = offset_type & 0xFFFF;
+  if (CensusOn()) {
+    gpu_census::Census& c = gpu_census::Get();
+    gpu_census::Add(c.set_constant2[0]);
+    gpu_census::Add(c.set_constant2[1], count - 1);
+  }
   WriteRegisterRangeFromRing(reader, index, count - 1);
   return true;
 }
@@ -1698,6 +2007,11 @@ bool CommandProcessor::ExecutePacketType3_LOAD_ALU_CONSTANT(memory::RingBuffer* 
   uint32_t size_dwords = reader->ReadAndSwap<uint32_t>();
   size_dwords &= 0xFFF;
   uint32_t type = (offset_type >> 16) & 0xFF;
+  if (CensusOn()) {
+    gpu_census::Census& c = gpu_census::Get();
+    gpu_census::Add(c.load_alu_constant[std::min(type, uint32_t(5))][0]);
+    gpu_census::Add(c.load_alu_constant[std::min(type, uint32_t(5))][1], size_dwords);
+  }
   uint32_t* xlat_address = memory_->TranslatePhysical<uint32_t*>(address);
   switch (type) {
     case 0:  // ALU
@@ -1726,6 +2040,11 @@ bool CommandProcessor::ExecutePacketType3_SET_SHADER_CONSTANTS(memory::RingBuffe
                                                                uint32_t packet, uint32_t count) {
   uint32_t offset_type = reader->ReadAndSwap<uint32_t>();
   uint32_t index = offset_type & 0xFFFF;
+  if (CensusOn()) {
+    gpu_census::Census& c = gpu_census::Get();
+    gpu_census::Add(c.set_shader_constants[0]);
+    gpu_census::Add(c.set_shader_constants[1], count - 1);
+  }
   WriteRegisterRangeFromRing(reader, index, count - 1);
   return true;
 }
@@ -1742,6 +2061,11 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
   uint32_t start = start_size >> 16;
   uint32_t size_dwords = start_size & 0xFFFF;  // dwords
   assert_true(start == 0);
+  if (CensusOn()) {
+    gpu_census::Census& c = gpu_census::Get();
+    gpu_census::Add(c.im_load[shader_type == xenos::ShaderType::kPixel ? 1 : 0]);
+    gpu_census::Add(c.im_load_dwords, size_dwords);
+  }
 
   auto shader =
       LoadShader(shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr), size_dwords);
@@ -1773,6 +2097,13 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer* 
   assert_true(start == 0);
   assert_true(reader->read_count() >= size_dwords * 4);
   assert_true(count - 2 >= size_dwords);
+  if (CensusOn()) {
+    // D3D's internal shaders (clears, resolves, the GPR-allocation flush): by size and type.
+    gpu_census::Census& c = gpu_census::Get();
+    gpu_census::Add(c.im_load_immediate[shader_type == xenos::ShaderType::kPixel ? 1 : 0]);
+    gpu_census::Add(c.im_load_dwords, size_dwords);
+    gpu_census::CountRow(gpu_census::RowKind::kImLoadImmediate, size_dwords, dword0 & 0x3);
+  }
   auto shader = LoadShader(shader_type, uint32_t(reader->read_ptr()),
                            reinterpret_cast<uint32_t*>(reader->read_ptr()), size_dwords);
   switch (shader_type) {
@@ -1793,8 +2124,11 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD_IMMEDIATE(memory::RingBuffer* 
 bool CommandProcessor::ExecutePacketType3_INVALIDATE_STATE(memory::RingBuffer* reader,
                                                            uint32_t packet, uint32_t count) {
   // selective invalidation of state pointers
-  /*uint32_t mask =*/reader->ReadAndSwap<uint32_t>();
+  uint32_t mask = reader->ReadAndSwap<uint32_t>();
   // driver_->InvalidateState(mask);
+  if (CensusOn()) {
+    gpu_census::CountRow(gpu_census::RowKind::kInvalidateState, mask);
+  }
   return true;
 }
 
@@ -1822,6 +2156,9 @@ bool CommandProcessor::ExecutePacketType3_VIZ_QUERY(memory::RingBuffer* reader, 
 
   uint32_t id = dword0 & 0x3F;
   uint32_t end = dword0 & 0x100;
+  if (CensusOn()) {
+    gpu_census::Add(gpu_census::Get().viz_query[end ? 1 : 0]);
+  }
   if (!end) {
     WriteRegister(XE_GPU_REG_VGT_EVENT_INITIATOR, VIZQUERY_START);
     if (REXCVAR_GET(occlusion_query_viz)) {

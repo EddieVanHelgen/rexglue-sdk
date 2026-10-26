@@ -32,6 +32,7 @@
 #include <rex/logging.h>
 #include <rex/memory/utils.h>
 #include <rex/graphics/gamma_mirror.h>
+#include <rex/graphics/gpu_census.h>
 #include <rex/graphics/resolve_readback.h>
 #include <rex/ui/frame_pacing.h>
 #include <rex/thread/mutex.h>
@@ -3086,6 +3087,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     // Make sure this memexporting draw is ordered with other work using shared
     // memory as a UAV.
     ++frame_stats_.memexport_draws;
+    if (gpu_census::Enabled()) {
+      gpu_census::Add(gpu_census::Get().draw_memexport);
+    }
     // TODO(Triang3l): Find some PM4 command that can be used for indication of
     // when memexports should be awaited?
     shared_memory_->MarkUAVWritesCommitNeeded();
@@ -3304,6 +3308,15 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath(bool only_requested) {
   const bool dump = resolve_readback::DumpingFrame();
   if (only_requested && !requested && !dump) {
     return true;
+  }
+  if (gpu_census::Enabled()) {
+    // A resolve read back to guest memory: for a title range (the CPU reads it), the readback_resolve mode,
+    // or the pass dump (rex/graphics/gpu_census.h).
+    const uint32_t reason = requested ? 0 : (dump ? 2 : 1);
+    gpu_census::Census& census = gpu_census::Get();
+    gpu_census::Add(census.resolve_readbacks[reason]);
+    gpu_census::Add(census.resolve_readback_bytes[reason], written_length);
+    gpu_census::CountRow(gpu_census::RowKind::kResolveReadback, written_address, reason, written_length);
   }
 
   // Skip all the GPU readback work if the destination memory isn't accessible.

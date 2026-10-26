@@ -23,6 +23,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/gpu_census.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/stream.h>
@@ -359,6 +360,11 @@ void GraphicsSystem::WriteRegisterThunk(void* ppc_context, GraphicsSystem* gs, u
 
 uint32_t GraphicsSystem::ReadRegister(uint32_t addr) {
   uint32_t r = (addr & 0xFFFF) / 4;
+  if (gpu_census::Enabled()) {
+    // The CPU's MMIO reads of GPU registers (rex/graphics/gpu_census.h).
+    gpu_census::AddShared(gpu_census::Get().mmio_reads);
+    gpu_census::CountRow(gpu_census::RowKind::kMmioRead, r);
+  }
 
   switch (r) {
     case 0x0F00:  // RB_EDRAM_TIMING
@@ -394,6 +400,13 @@ uint32_t GraphicsSystem::ReadRegister(uint32_t addr) {
 
 void GraphicsSystem::WriteRegister(uint32_t addr, uint32_t value) {
   uint32_t r = (addr & 0xFFFF) / 4;
+  if (gpu_census::Enabled()) {
+    // The CPU's MMIO writes to GPU registers (rex/graphics/gpu_census.h).
+    gpu_census::AddShared(gpu_census::Get().mmio_writes);
+    if (gpu_census::Row* row = gpu_census::CountRow(gpu_census::RowKind::kMmioWrite, r)) {
+      row->last0.store(value, std::memory_order_relaxed);
+    }
+  }
 
   switch (r) {
     case 0x01C5:  // CP_RB_WPTR
@@ -426,10 +439,19 @@ void GraphicsSystem::SetInterruptCallback(uint32_t callback, uint32_t user_data)
   interrupt_callback_ = callback;
   interrupt_callback_data_ = user_data;
   REXGPU_INFO("SetInterruptCallback({:08X}, {:08X})", callback, user_data);
+  // Recorded whether or not the census is on yet (the title sets this up once, at boot).
+  gpu_census::Census& census = gpu_census::Get();
+  gpu_census::AddShared(census.set_interrupt_callback);
+  census.interrupt_callback.store(callback, std::memory_order_relaxed);
+  census.interrupt_callback_data.store(user_data, std::memory_order_relaxed);
 }
 
 void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
+  const bool census = gpu_census::Enabled();
   if (!interrupt_callback_) {
+    if (census) {
+      gpu_census::AddShared(gpu_census::Get().interrupts_no_callback);
+    }
     return;
   }
 
@@ -446,14 +468,30 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
   //          interrupt_callback_, source, cpu);
 
   uint64_t args[] = {source, interrupt_callback_data_};
+  const auto census_start =
+      census ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   function_dispatcher_->ExecuteInterrupt(thread->thread_state(), interrupt_callback_, args,
                                          rex::countof(args));
+  if (census) {
+    // By CPU and source, with the time spent in the title's handler.
+    const uint64_t us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                     std::chrono::steady_clock::now() - census_start)
+                                     .count());
+    gpu_census::AddShared(gpu_census::Get().interrupts[source ? 1 : 0]);
+    if (gpu_census::Row* row =
+            gpu_census::CountRow(gpu_census::RowKind::kInterrupt, cpu, source, us)) {
+      gpu_census::MaxShared(row->max, us);
+    }
+  }
 }
 
 void GraphicsSystem::MarkVblank() {
   // TODO: Enable profiling once ported
   // SCOPE_profile_cpu_f("gpu");
   ui::frame_pacing::Record(ui::frame_pacing::Event::kGuestVblank);
+  if (gpu_census::Enabled()) {
+    gpu_census::AddShared(gpu_census::Get().vblanks);
+  }
 
   // Increment vblank counter (so the game sees us making progress).
   if (command_processor_) {
