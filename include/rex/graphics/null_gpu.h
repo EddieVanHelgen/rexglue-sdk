@@ -52,4 +52,41 @@ double GuestVblankHz();
 void SetGuestVblankDivider(uint32_t divider);
 uint32_t GuestVblankDivider();
 
+// Present queue depth override (PDZ stage 2 M5). With host vblank pacing (one Present(1, 0) per guest vblank) and
+// guest vblanks at the display's own rate (120 on a 120 Hz display), presents are as frequent as refreshes: one extra
+// present in a refresh (a late-latched frame after the vblank's own paint while the UI repaints at every tick) leaves
+// the DXGI queue a frame deeper for good, and once it holds DXGI's default 3, every Present blocks inside the runtime
+// until the next flip. The game thread's ExecuteCommandLists on the shared direct queue and its resource creation
+// then wait behind that call (PDZ: ~4.4 ms of submit and ~2.3 ms of texture creation per frame at 120). A swap chain
+// with a frame latency waitable object of depth N waits for room before painting, outside the runtime, instead.
+// - SetPresentMaxFrameLatency: N (1-3; larger is taken as 3) for the D3D12 presenter's swap chains when the
+//   present_max_frame_latency cvar is 0 (the cvar, when set, wins); 0 = none (the default: DXGI's own 3, no waitable
+//   object, as before). Read when a swap chain is created: set it before the window's surface connects.
+void SetPresentMaxFrameLatency(uint32_t frames);
+uint32_t PresentMaxFrameLatency();
+
+// Host present statistics (PDZ stage 2 M5), gathered by the D3D12 presenter only while enabled (default off: nothing
+// is timed then). Sums are cumulative; the max fields are since the previous TakePresentStats (one reader).
+struct PresentStats {
+  uint64_t presents = 0;             // Present calls
+  uint64_t present_us = 0;           // their total duration
+  uint64_t present_max_us = 0;       // the longest (since the previous take)
+  uint64_t presents_over_2ms = 0;    // calls that took more than 2 ms (blocked in the runtime)
+  uint64_t repeats = 0;              // presents of the same guest frame as the previous present
+  uint64_t ui_paints = 0;            // presents that also drew the UI (overlay drawers)
+  uint64_t latency_waits = 0;        // frame latency waitable waits (none without a waitable object)
+  uint64_t latency_wait_us = 0;      // their total duration
+  uint64_t latency_wait_max_us = 0;  // the longest (since the previous take)
+  uint64_t latency_timeouts = 0;     // waits that ran into the 100 ms bound
+  uint32_t frame_latency = 0;        // the current swap chain's waitable depth (0 = none)
+};
+void EnablePresentStats(bool enable);
+bool PresentStatsEnabled();
+// Called by the presenter's painting thread after each Present. latency_wait_us < 0: no waitable wait.
+void RecordPresent(uint64_t present_us, int64_t latency_wait_us, bool latency_timeout, bool repeat,
+                   bool ui_paint);
+// Called by the presenter when it creates a swap chain: its waitable depth (0 = none).
+void SetPresentFrameLatencyInUse(uint32_t frames);
+PresentStats TakePresentStats();
+
 }  // namespace rex::graphics::null_gpu

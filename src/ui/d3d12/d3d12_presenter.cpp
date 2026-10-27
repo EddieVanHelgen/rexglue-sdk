@@ -19,6 +19,7 @@
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
+#include <rex/graphics/null_gpu.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_presenter.h>
@@ -436,7 +437,18 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
       // rate.
       swap_chain_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
     }
-    const int32_t max_frame_latency = REXCVAR_GET(present_max_frame_latency);
+    // A title's override (null_gpu::SetPresentMaxFrameLatency, PDZ stage 2 M5) when the cvar is 0.
+    const int32_t max_frame_latency_cvar = REXCVAR_GET(present_max_frame_latency);
+    const int32_t max_frame_latency =
+        max_frame_latency_cvar > 0
+            ? max_frame_latency_cvar
+            : int32_t(std::min(rex::graphics::null_gpu::PresentMaxFrameLatency(), uint32_t(3)));
+    if (max_frame_latency > 0 && max_frame_latency_cvar <= 0) {
+      REXLOG_INFO(
+          "D3D12Presenter: swap chain with a frame latency waitable object of {} (the title's "
+          "null_gpu::SetPresentMaxFrameLatency; present_max_frame_latency is 0)",
+          max_frame_latency);
+    }
     if (max_frame_latency > 0) {
       swap_chain_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
     }
@@ -488,6 +500,8 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
         return SurfacePaintConnectResult::kFailure;
       }
     }
+    rex::graphics::null_gpu::SetPresentFrameLatencyInUse(
+        paint_context_.swap_chain_frame_latency_waitable ? uint32_t(max_frame_latency) : 0);
     for (uint32_t i = 0; i < PaintContext::kSwapChainBufferCount; ++i) {
       if (FAILED(paint_context_.swap_chain->GetBuffer(
               i, IID_PPV_ARGS(&paint_context_.swap_chain_buffers[i])))) {
@@ -598,10 +612,24 @@ void D3D12Presenter::PaintContext::DestroySwapChain() {
 }
 
 Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawers) {
-  // With present_max_frame_latency, don't queue more presents than that -
-  // bounded, so a lost signal can't hang painting.
+  // With present_max_frame_latency (or the title's
+  // null_gpu::SetPresentMaxFrameLatency), don't queue more presents than that -
+  // bounded, so a lost signal can't hang painting. With
+  // null_gpu::EnablePresentStats (PDZ stage 2 M5) this wait and the Present
+  // call are timed.
+  const bool present_stats = rex::graphics::null_gpu::PresentStatsEnabled();
+  int64_t latency_wait_us = -1;
+  bool latency_timeout = false;
   if (paint_context_.swap_chain_frame_latency_waitable) {
-    WaitForSingleObjectEx(paint_context_.swap_chain_frame_latency_waitable, 100, TRUE);
+    const auto wait_start =
+        present_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
+    latency_timeout = WaitForSingleObjectEx(paint_context_.swap_chain_frame_latency_waitable, 100,
+                                            TRUE) == WAIT_TIMEOUT;
+    if (present_stats) {
+      latency_wait_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - wait_start)
+                            .count();
+    }
   }
   // Begin the command list with the command allocator not currently potentially
   // used on the GPU.
@@ -1210,6 +1238,16 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
                 0, DXGI_PRESENT_RESTART | (paint_context_.swap_chain_allows_tearing
                                                ? DXGI_PRESENT_ALLOW_TEARING
                                                : 0));
+  if (present_stats) {
+    const uint64_t present_call_us = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                  std::chrono::steady_clock::now() - present_start)
+                                                  .count());
+    const uint64_t frame_seq = guest_output_resource ? guest_output_properties.frame_seq : 0;
+    rex::graphics::null_gpu::RecordPresent(present_call_us, latency_wait_us, latency_timeout,
+                                           frame_seq && frame_seq == present_stats_last_frame_seq_,
+                                           execute_ui_drawers);
+    present_stats_last_frame_seq_ = frame_seq;
+  }
   if (trace_pacing) {
     const auto present_us = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - present_start);

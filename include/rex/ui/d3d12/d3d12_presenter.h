@@ -320,6 +320,8 @@ class D3D12Presenter final : public Presenter {
   // DisconnectPaintingFromSurfaceFromUIThreadImpl) by the thread doing it, as
   // well as by presenter initialization and shutdown.
   PaintContext paint_context_;
+  // Painting only: the guest frame of the previous present (null_gpu present statistics, repeats).
+  uint64_t present_stats_last_frame_seq_ = 0;
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
   void* temporal_upscaler_context_ = nullptr;
