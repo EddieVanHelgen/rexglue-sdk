@@ -152,6 +152,12 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
     return X_STATUS_UNSUCCESSFUL;
   }
   command_processor_->SetDesiredSwapPostEffect(ParseSwapPostEffect(REXCVAR_GET(swap_post_effect)));
+  // A title's write pointer hand-off (null_gpu::SetWritePointerFilter, PDZ stage 2 M5) delivers here.
+  null_gpu::SetWritePointerSink(
+      [](void* context, uint32_t value) {
+        static_cast<GraphicsSystem*>(context)->command_processor_->UpdateWritePointer(value);
+      },
+      this);
 
   // Register GPU MMIO handlers
   // GPU registers are at 0x7FC80000-0x7FCFFFFF
@@ -331,6 +337,7 @@ void GraphicsSystem::Shutdown() {
   }
 
   if (command_processor_) {
+    null_gpu::SetWritePointerSink(nullptr, nullptr);
     command_processor_->Shutdown();
     command_processor_.reset();
   }
@@ -426,6 +433,9 @@ void GraphicsSystem::WriteRegister(uint32_t addr, uint32_t value) {
 
   switch (r) {
     case 0x01C5:  // CP_RB_WPTR
+      if (null_gpu::FilterWritePointer(value)) {
+        break;  // a title's write pointer hand-off: it delivers the value itself (null_gpu.h)
+      }
       command_processor_->UpdateWritePointer(value);
       break;
     case 0x0F01:  // RB_BC_CONTROL

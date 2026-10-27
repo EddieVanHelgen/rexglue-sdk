@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <mutex>
 
 namespace rex::graphics::null_gpu {
 
@@ -17,6 +18,12 @@ std::atomic<double> g_guest_vblank_hz{0.0};
 std::atomic<uint32_t> g_guest_vblank_divider{1};
 std::atomic<uint32_t> g_present_max_frame_latency{0};
 std::atomic<bool> g_present_stats_enabled{false};
+std::atomic<WritePointerFilter> g_write_pointer_filter{nullptr};
+// The sink is set / cleared by the graphics system and used by the title's thread: one mutex keeps a delivery from
+// running into a command processor being destroyed (one lock per kick, uncontended).
+std::mutex g_write_pointer_sink_mutex;
+WritePointerSink g_write_pointer_sink = nullptr;
+void* g_write_pointer_sink_context = nullptr;
 
 struct PresentCounters {
   std::atomic<uint64_t> presents{0}, present_us{0}, present_max_us{0}, presents_over_2ms{0}, repeats{0},
@@ -127,6 +134,30 @@ PresentStats TakePresentStats() {
   s.latency_timeouts = c.latency_timeouts.load(std::memory_order_relaxed);
   s.frame_latency = c.frame_latency.load(std::memory_order_relaxed);
   return s;
+}
+
+void SetWritePointerFilter(WritePointerFilter filter) {
+  g_write_pointer_filter.store(filter, std::memory_order_release);
+}
+
+bool FilterWritePointer(uint32_t value) {
+  const WritePointerFilter filter = g_write_pointer_filter.load(std::memory_order_acquire);
+  return filter && filter(value);
+}
+
+void SetWritePointerSink(WritePointerSink sink, void* context) {
+  std::lock_guard<std::mutex> lock(g_write_pointer_sink_mutex);
+  g_write_pointer_sink = sink;
+  g_write_pointer_sink_context = context;
+}
+
+bool DeliverWritePointer(uint32_t value) {
+  std::lock_guard<std::mutex> lock(g_write_pointer_sink_mutex);
+  if (!g_write_pointer_sink) {
+    return false;
+  }
+  g_write_pointer_sink(g_write_pointer_sink_context, value);
+  return true;
 }
 
 }  // namespace rex::graphics::null_gpu

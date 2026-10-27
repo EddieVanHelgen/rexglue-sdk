@@ -89,4 +89,25 @@ void RecordPresent(uint64_t present_us, int64_t latency_wait_us, bool latency_ti
 void SetPresentFrameLatencyInUse(uint32_t frames);
 PresentStats TakePresentStats();
 
+
+// Ring write pointer hand-off (PDZ stage 2 M5, the title's record thread). A title that does the work a guest draw
+// stands for on its own thread (after the guest's D3D call has returned) must not let the command processor run ahead
+// of that thread: every fence, read-pointer write-back and interrupt the guest observes says "the GPU is past this
+// point", and the guest reuses vertex / index / texture / ring memory on that word. With a filter set, each CPU write
+// of CP_RB_WPTR (GraphicsSystem::WriteRegister, the guest's kick) goes to the filter first:
+// - the filter returns true: it took the value and hands it to the command processor itself, later and in order,
+//   through DeliverWritePointer (from any thread; values in the order the guest wrote them);
+// - false (or no filter set): the command processor gets it now, as without a filter.
+// Any backend (the null one and the D3D12 one share GraphicsSystem). Default: no filter, nothing changes.
+// - SetWritePointerFilter: set before the guest runs (nullptr = none); read at every CP_RB_WPTR write.
+// - SetWritePointerSink: the graphics system registers its command processor's UpdateWritePointer when it creates
+//   it and clears it before destroying it (nullptr). DeliverWritePointer returns false when no sink is set.
+using WritePointerFilter = bool (*)(uint32_t value);
+void SetWritePointerFilter(WritePointerFilter filter);
+// Called by GraphicsSystem::WriteRegister for CP_RB_WPTR: true = the title took the value.
+bool FilterWritePointer(uint32_t value);
+using WritePointerSink = void (*)(void* context, uint32_t value);
+void SetWritePointerSink(WritePointerSink sink, void* context);
+bool DeliverWritePointer(uint32_t value);
+
 }  // namespace rex::graphics::null_gpu
