@@ -36,6 +36,8 @@ namespace rex::ui::frame_pacing {
 
 namespace {
 
+std::atomic<int> g_output_pairing{int(OutputPairing::kCpSwap)};
+
 class Trace {
  public:
   static Trace& Get() {
@@ -121,6 +123,8 @@ class Trace {
           frame.input_age_us = last_input_age_us_;
         }
         frame.vdswap = now;
+        newest_vdswap_ = frame;
+        newest_vdswap_valid_ = true;
         pending_swaps_[pending_swap_end_++ % kPendingSwaps] = frame;
         if (pending_swap_end_ - pending_swap_begin_ > kPendingSwaps) {
           pending_swap_begin_ = pending_swap_end_ - kPendingSwaps;
@@ -134,9 +138,16 @@ class Trace {
         break;
       case Event::kGuestOutput: {
         FrameLatency& frame = frames_[a % kFrameHistory];
-        frame = cp_swap_valid_ ? cp_swap_ : FrameLatency{};
+        if (g_output_pairing.load(std::memory_order_relaxed) ==
+            int(OutputPairing::kNewestVdSwap)) {
+          // A title renderer presenting from the guest's Swap: the newest VdSwap, once.
+          frame = newest_vdswap_valid_ ? newest_vdswap_ : FrameLatency{};
+          newest_vdswap_valid_ = false;
+        } else {
+          frame = cp_swap_valid_ ? cp_swap_ : FrameLatency{};
+          cp_swap_valid_ = false;
+        }
         frame.seq = a;
-        cp_swap_valid_ = false;
       } break;
       case Event::kHostPresent: {
         FrameLatency& frame = frames_[a % kFrameHistory];
@@ -255,6 +266,11 @@ class Trace {
       std::fprintf(file_, "C,0,%s=%s,%d\n", name, rex::cvar::GetFlagByName(name).c_str(),
                    int(rex::cvar::GetFlagSource(name)));
     }
+    std::fprintf(file_, "C,0,output_pairing=%s,0\n",
+                 g_output_pairing.load(std::memory_order_relaxed) ==
+                         int(OutputPairing::kNewestVdSwap)
+                     ? "newest_vdswap"
+                     : "cp_swap");
   }
 
   // Timestamps the real display vblanks of the primary monitor and flushes the
@@ -313,6 +329,9 @@ class Trace {
   uint64_t pending_swap_end_ = 0;
   FrameLatency cp_swap_ = {};
   bool cp_swap_valid_ = false;
+  // OutputPairing::kNewestVdSwap: the newest VdSwap, until a published frame takes it.
+  FrameLatency newest_vdswap_ = {};
+  bool newest_vdswap_valid_ = false;
   std::array<FrameLatency, kFrameHistory> frames_ = {};
   std::vector<double> input_to_display_ms_;
   std::vector<double> input_to_present_ms_;
@@ -342,6 +361,10 @@ TotalsCounters g_totals;
 
 bool Enabled() {
   return REXCVAR_GET(frame_pacing_log);
+}
+
+void SetOutputPairing(OutputPairing pairing) {
+  g_output_pairing.store(int(pairing), std::memory_order_relaxed);
 }
 
 void Record(Event event, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_t e,

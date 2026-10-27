@@ -54,6 +54,16 @@ enum class Event : char {
 
 bool Enabled();
 
+// Which guest swap a published guest frame ('R', kGuestOutput) belongs to, for the latency rows
+// ('L', 'D', the summary). kCpSwap (default): the swap whose XE_SWAP the command processor reached
+// last, right for a GPU backend that refreshes the presenter at XE_SWAP. kNewestVdSwap: the newest
+// VdSwap, for a renderer in the title that refreshes the presenter from the guest's Swap call,
+// before the command processor reaches that swap (with kCpSwap its frames would be paired with the
+// previous swap whenever the refresh beats the XE_SWAP: latency one frame too high). Any thread;
+// set it before the first frame (PDZ stage 2 M3).
+enum class OutputPairing : int { kCpSwap = 0, kNewestVdSwap = 1 };
+void SetOutputPairing(OutputPairing pairing);
+
 void Record(Event event, uint64_t a = 0, uint64_t b = 0, uint64_t c = 0, uint64_t d = 0,
             uint64_t e = 0, uint64_t f = 0);
 

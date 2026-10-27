@@ -9,6 +9,7 @@
 
 #include <rex/graphics/gamma_mirror.h>
 #include <rex/graphics/graphics_system.h>
+#include <rex/graphics/null_gpu.h>
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/registers.h>
 #include <rex/graphics/resolve_readback.h>
@@ -230,11 +231,12 @@ void NullCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuf
   gamma_mirror::Publish(reinterpret_cast<const uint32_t*>(gamma_ramp_256_entry_table()));
   // The 'F' row the D3D12 backend writes when it opens a frame: no host GPU frame in flight here.
   ui::frame_pacing::Record(ui::frame_pacing::Event::kGpuFrameOpen, 0);
-  // Nothing is handed to the presenter: the guest output is the title's (its renderer refreshes the
-  // presenter from the guest Swap; the vsync worker's host vblank latch is the base graphics
-  // system's, as with the D3D12 backend). A same-frame capture of the emulated output
-  // (Presenter::RequestGuestOutputCapture) has no emulated frame to capture: answered at once with
-  // an empty image so a title waiting for it gets no capture instead of waiting.
+  // Nothing is handed to the presenter here: the guest output is the title's (its renderer
+  // refreshes the presenter from the guest Swap, or from the XE_SWAP listener called at the end;
+  // the vsync worker's host vblank latch is the base graphics system's, as with the D3D12 backend).
+  // A same-frame capture of the emulated output (Presenter::RequestGuestOutputCapture) has no
+  // emulated frame to capture: answered at once with an empty image so a title waiting for it gets
+  // no capture instead of waiting.
   if (ui::Presenter::RequestedGuestOutputCapture() == swap_index) {
     ui::Presenter::StoreGuestOutputCapture(swap_index, ui::RawImage());
     if (!logged_capture_) {
@@ -259,6 +261,9 @@ void NullCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuf
         uint32_t(*reinterpret_cast<const volatile uint32_t*>(&counter_)),
         draws_.load(std::memory_order_relaxed), copies_.load(std::memory_order_relaxed));
   }
+  // The title's XE_SWAP listener (null_gpu.h; PDZ: pdz_native_present_timing 1 hands the native
+  // frame of this swap to the presenter here, where the D3D12 backend refreshes it).
+  null_gpu::NotifySwap(swap_index, frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
 }
 
 NullCommandProcessor::Status NullCommandProcessor::GetStatus() const {
