@@ -24,6 +24,7 @@
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/gpu_census.h>
+#include <rex/graphics/null_gpu.h>
 #include <rex/kernel/xboxkrnl/video.h>
 #include <rex/logging.h>
 #include <rex/stream.h>
@@ -180,7 +181,18 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
       new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
         system::X_VIDEO_MODE video_mode;
         kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
-        const double refresh_rate_hz = std::max(1.0, double(float(video_mode.refresh_rate)));
+        // A title's guest vblank rate (null_gpu::SetGuestVblankHz, PDZ stage 2 M5) in place of
+        // the video mode's; 0 (the default) = the video mode's, as before.
+        const double vblank_hz_override = null_gpu::GuestVblankHz();
+        const double refresh_rate_hz =
+            vblank_hz_override > 0.0 ? vblank_hz_override
+                                     : std::max(1.0, double(float(video_mode.refresh_rate)));
+        if (vblank_hz_override > 0.0) {
+          REXGPU_INFO(
+              "vsync worker: guest vblanks at {} Hz (null_gpu::SetGuestVblankHz; the guest's video "
+              "mode still reports {} Hz)",
+              refresh_rate_hz, float(video_mode.refresh_rate));
+        }
         const uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
         const uint64_t vsync_interval_ticks =
             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
@@ -201,6 +213,8 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             rex::thread::Sleep(std::chrono::milliseconds(1));
             continue;
           }
+          // One guest vblank every N periods (null_gpu::SetGuestVblankDivider; 1 by default).
+          const int64_t divider = int64_t(null_gpu::GuestVblankDivider());
           if (host_vblank_pacing) {
             const int64_t now_ns = SteadyNowNs();
             int64_t target_ns;
@@ -214,7 +228,7 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
               int64_t earliest_ns = now_ns;
               if (last_guest_vblank_ns) {
                 earliest_ns = std::max(earliest_ns, last_guest_vblank_ns +
-                                                        int64_t(grid.divisor) * grid.period_ns -
+                                                        int64_t(grid.divisor) * divider * grid.period_ns -
                                                         grid.period_ns / 2);
               }
               const int64_t vblanks =
@@ -223,8 +237,9 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
             } else {
               // Variable refresh rate (or no lock yet): evenly timed vblanks,
               // with presents following them.
-              const int64_t period_ns = int64_t(
-                  1000000000.0 / (refresh_rate_hz * chrono::Clock::guest_time_scalar()));
+              const int64_t period_ns =
+                  int64_t(1000000000.0 / (refresh_rate_hz * chrono::Clock::guest_time_scalar())) *
+                  divider;
               target_ns = last_guest_vblank_ns ? last_guest_vblank_ns + period_ns : now_ns;
               if (target_ns < now_ns - period_ns) {
                 target_ns = now_ns;  // Drop the missed beats after a stall.
@@ -249,10 +264,11 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
           }
           // Real time of one vblank period at the current guest speed.
           const double period_ns =
-              1000000000.0 / (refresh_rate_hz * chrono::Clock::guest_time_scalar());
+              1000000000.0 / (refresh_rate_hz * chrono::Clock::guest_time_scalar()) *
+              double(divider);
 #if REX_PLATFORM_WIN32
           const uint64_t current_time = chrono::Clock::QueryGuestTickCount();
-          if (current_time - last_frame_time >= vsync_interval_ticks) {
+          if (current_time - last_frame_time >= vsync_interval_ticks * uint64_t(divider)) {
             // Drop the missed beats: a burst of vblanks after a stall would make
             // the title fast-forward through several frames at once.
             last_frame_time = current_time;

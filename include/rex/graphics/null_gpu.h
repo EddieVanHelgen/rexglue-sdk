@@ -39,4 +39,17 @@ void SetSwapListener(SwapListener listener);
 // Called by the null command processor.
 void NotifySwap(uint64_t swap_index, uint32_t frontbuffer_ptr, uint32_t width, uint32_t height);
 
+// Guest vblank pacing overrides (PDZ stage 2 M5, the title's pdz_null_refresh_hz). Honoured by the vsync worker of
+// any backend and by the presenter's host-vblank divisor; the video mode the guest reads (VdQueryVideoMode,
+// video_mode_refresh_rate) is not changed. Defaults: 0 Hz (= video_mode_refresh_rate, today's behaviour) and
+// divider 1, so nothing changes unless a title sets them.
+// - SetGuestVblankHz: the guest vblank rate in Hz (0 = video_mode_refresh_rate). Set it before the GPU setup: the
+//   vsync worker reads it once when it starts, the presenter whenever the display output changes.
+// - SetGuestVblankDivider: deliver one guest vblank every N periods (N >= 1; 0 is taken as 1), e.g. 2 at a 120 Hz
+//   guest rate = 60 vblanks/s. Read at every vblank: it may change at any time, from any thread.
+void SetGuestVblankHz(double hz);
+double GuestVblankHz();
+void SetGuestVblankDivider(uint32_t divider);
+uint32_t GuestVblankDivider();
+
 }  // namespace rex::graphics::null_gpu

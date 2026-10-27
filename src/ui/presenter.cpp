@@ -18,6 +18,7 @@
 
 #include <rex/assert.h>
 #include <rex/cvar.h>
+#include <rex/graphics/null_gpu.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
 #include <rex/ui/frame_pacing.h>
@@ -1822,7 +1823,12 @@ uint32_t GetHostVblankDivisor(IDXGIOutput* output, double& host_period_ns_out) {
   }
   // Integer, so 119 for 119.88 Hz - the phase lock refines the period.
   const double host_hz = double(display_mode.dmDisplayFrequency);
-  const double guest_hz = std::clamp(REXCVAR_GET(video_mode_refresh_rate), 24.0, 480.0);
+  // A title's guest vblank rate (null_gpu::SetGuestVblankHz, PDZ stage 2 M5) when set, as the
+  // vsync worker paces it; otherwise the video mode's.
+  const double vblank_hz_override = graphics::null_gpu::GuestVblankHz();
+  const double guest_hz = vblank_hz_override > 0.0
+                              ? vblank_hz_override
+                              : std::clamp(REXCVAR_GET(video_mode_refresh_rate), 24.0, 480.0);
   const long divisor = std::lround(host_hz / guest_hz);
   if (divisor < 1 || std::abs(host_hz - divisor * guest_hz) > 1.5) {
     REXLOG_WARN(
