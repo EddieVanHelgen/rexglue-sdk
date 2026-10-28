@@ -33,6 +33,8 @@ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
 
 REXCVAR_DEFINE_BOOL(vibration, true, "Input", "Enable controller vibration");
+// Defined in kernel/xam/xam_user.cpp (PDZ fork: local guests).
+REXCVAR_DECLARE(bool, local_guest_users);
 
 REXCVAR_DEFINE_DOUBLE(left_stick_deadzone_percentage, 0.0, "Input",
                       "Deadzone applied to the left stick, as a fraction of its range")
@@ -51,6 +53,7 @@ constexpr uint32_t kSyntheticOrdinal = UINT32_MAX;
 
 // XN_SYS_INPUTDEVICESCHANGED
 constexpr uint32_t kXNotificationSystemInputDevicesChanged = 0x00000012;
+constexpr uint32_t kXNotificationSystemSignInChanged = 0x0000000A;
 
 }  // namespace
 
@@ -251,6 +254,11 @@ void InputSystem::UpdateConnectedUser(uint32_t user_index, bool connected) {
   // a pad plugged in mid-game is never noticed.
   if (auto* kernel_state = REX_KERNEL_STATE()) {
     kernel_state->BroadcastNotification(kXNotificationSystemInputDevicesChanged, 0);
+    // PDZ fork: users 1-3 are signed-in local guests while their pad is connected
+    // (xam_user.cpp IsLocalGuest); titles rescan their users on XN_SYS_SIGNINCHANGED.
+    if (user_index >= 1 && REXCVAR_GET(local_guest_users)) {
+      kernel_state->BroadcastNotification(kXNotificationSystemSignInChanged, 1u << user_index);
+    }
   }
 
   if (!connected) {

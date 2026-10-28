@@ -12,13 +12,17 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
+#include <algorithm>
 #include <cstring>
+#include <string>
 
 #include <rex/cvar.h>
+#include <rex/input/input_system.h>
 #include <rex/kernel/xam/private.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/hook.h>
+#include <rex/runtime.h>
 #include <rex/types.h>
 #include <rex/string.h>
 #include <rex/system/kernel_state.h>
@@ -31,12 +35,42 @@
 REXCVAR_DEFINE_UINT32(user_language, 1, "Kernel", "User's language ID");
 // Defined in xam_locale.cpp.
 REXCVAR_DECLARE(uint32_t, user_country);
+REXCVAR_DEFINE_BOOL(local_guest_users, true, "Kernel",
+                    "Users 1-3 with a connected controller are signed-in local guests of user 0 (a XUID, "
+                    "a name, signed in locally; no Live, no storage), as a console's guests");
 
 namespace rex {
 namespace kernel {
 namespace xam {
 using namespace rex::system;
 using namespace rex::system::xam;
+
+// PDZ fork (log 098: in split screen player 2 could not buy at PDZ's shop; the title ties a
+// local player to a signed-in profile per controller, and only user 0 was ever signed in).
+// Users 1-3 are local guests of user 0 while their controller is connected, as on a console:
+// signed in locally (offline), a XUID of their own (the title drops a player whose XUID is
+// another pad's), the name "<user 0>(n)". No Live, no profile settings, no storage (their
+// content calls fail, so nothing is written to user 0's save container). User 0 is unchanged.
+static bool IsLocalGuest(uint32_t user_index) {
+  if (user_index < 1 || user_index > 3 || !REXCVAR_GET(local_guest_users)) {
+    return false;
+  }
+  auto* emulator = REX_KERNEL_STATE()->emulator();
+  auto* is = emulator ? static_cast<rex::input::InputSystem*>(emulator->input_system()) : nullptr;
+  return is && is->GetConnectedUsers().test(user_index);
+}
+
+static uint64_t LocalGuestXuid(uint32_t user_index) {
+  // User 0's offline XUID (0xE...) with bits 40-41 changed: distinct per guest and from user 0.
+  return REX_KERNEL_STATE()->user_profile()->xuid() ^ (uint64_t(user_index) << 40);
+}
+
+static std::string LocalGuestName(uint32_t user_index) {
+  const std::string suffix = "(" + std::to_string(user_index) + ")";
+  std::string name = REX_KERNEL_STATE()->user_profile()->name();
+  name.resize(std::min<size_t>(name.size(), 15 - suffix.size()));
+  return name + suffix;
+}
 
 i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
   assert_true(type_mask == 1 || type_mask == 2 || type_mask == 3 || type_mask == 4 ||
@@ -59,6 +93,9 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
         xuid = user_profile->xuid();
         result = X_E_SUCCESS;
       }
+    } else if (IsLocalGuest(user_index) && (type_mask & 1)) {
+      xuid = LocalGuestXuid(user_index);  // offline only
+      result = X_E_SUCCESS;
     }
   } else {
     result = X_E_INVALIDARG;
@@ -73,6 +110,8 @@ uint32_t xeXamUserGetSigninState(uint32_t user_index) {
     if (user_index == 0) {
       const auto& user_profile = REX_KERNEL_STATE()->user_profile();
       signin_state = user_profile->signin_state();
+    } else if (IsLocalGuest(user_index)) {
+      signin_state = 1;  // signed in locally
     }
   }
   return signin_state;
@@ -98,6 +137,12 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
   }
 
   std::memset(info, 0, sizeof(X_USER_SIGNIN_INFO));
+  if (IsLocalGuest(user_index)) {
+    info->xuid = LocalGuestXuid(user_index);
+    info->signin_state = 1;
+    rex::string::copy_truncating(info->name, LocalGuestName(user_index), rex::countof(info->name));
+    return X_E_SUCCESS;
+  }
   if (user_index) {
     return X_E_NO_SUCH_USER;
   }
@@ -114,6 +159,10 @@ u32 XamUserGetName_entry(u32 user_index, mapped_string buffer, u32 buffer_len) {
     return X_E_INVALIDARG;
   }
 
+  if (IsLocalGuest(user_index)) {
+    rex::string::copy_truncating(buffer, LocalGuestName(user_index), std::min(buffer_len, uint32_t(16)));
+    return X_E_SUCCESS;
+  }
   if (user_index) {
     return X_E_NO_SUCH_USER;
   }
@@ -129,7 +178,7 @@ u32 XamUserGetGamerTag_entry(u32 user_index, mapped_wstring buffer, u32 buffer_l
     return X_E_INVALIDARG;
   }
 
-  if (user_index) {
+  if (user_index && !IsLocalGuest(user_index)) {
     return X_E_NO_SUCH_USER;
   }
 
@@ -138,7 +187,7 @@ u32 XamUserGetGamerTag_entry(u32 user_index, mapped_wstring buffer, u32 buffer_l
   }
 
   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
-  auto user_name = rex::string::to_utf16(user_profile->name());
+  auto user_name = rex::string::to_utf16(user_index ? LocalGuestName(user_index) : user_profile->name());
   rex::string::copy_and_swap_truncating(buffer, user_name, std::min(buffer_len, uint32_t(16)));
   return X_E_SUCCESS;
 }
@@ -384,7 +433,7 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value) 
       return X_ERROR_INVALID_PARAMETER;
     }
 
-    if (user_index) {
+    if (user_index && !IsLocalGuest(user_index)) {
       return X_ERROR_NO_SUCH_USER;
     }
   }
@@ -798,6 +847,12 @@ u32 XamUserGetUserFlagsFromXUID_entry(u64 xuid) {
 u32 XamUserGetIndexFromXUID_entry(u64 xuid, u32 flags, mapped_u32 index) {
   if (!index) {
     return X_E_INVALIDARG;
+  }
+  for (uint32_t guest = 1; guest < 4; ++guest) {
+    if (xuid && IsLocalGuest(guest) && xuid == LocalGuestXuid(guest)) {
+      *index = guest;
+      return X_ERROR_SUCCESS;
+    }
   }
   if (!IsSignedInXuid(xuid)) {
     return X_E_NO_SUCH_USER;

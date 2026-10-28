@@ -124,6 +124,16 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
                        u32 content_data_size, u32 flags, mapped_u32 disposition_ptr,
                        mapped_u32 license_mask_ptr, u32 cache_size, u64 content_size,
                        mapped_void overlapped_ptr) {
+  // PDZ fork: users 1-3 (local guests, xam_user.cpp) have no storage. Every content root is
+  // user 0's XUID here, so a guest's save would land in user 0's container.
+  if (user_index >= 1 && user_index <= 3) {
+    if (overlapped_ptr) {
+      REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(),
+                                                      X_ERROR_ACCESS_DENIED);
+      return X_ERROR_IO_PENDING;
+    }
+    return X_ERROR_ACCESS_DENIED;
+  }
   uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
 
   XCONTENT_AGGREGATE_DATA content_data;
