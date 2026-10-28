@@ -132,6 +132,28 @@ u32 XamInputSetState_entry(u32 user_index, u32 unk, ppc_ptr_t<X_INPUT_VIBRATION>
   return is->SetState(actual_user_index, vibration);
 }
 
+// PDZ fork (log 104: in split screen player 2's face buttons never reached the menus, while his
+// sticks did): a keystroke query for any user (user 255 or XINPUT_FLAG_ANY_USER, as PDZ's XUI
+// input pump asks) was answered from user 0's pad only. Now every user's pad is asked, starting
+// from the one after the last that answered (so no pad starves the others), and the keystroke
+// carries the user it came from, as on the console. With one pad connected this is user 0's, as
+// before.
+static X_RESULT GetKeystrokeAnyUser(rex::input::InputSystem* is, uint32_t flags,
+                                    X_INPUT_KEYSTROKE* keystroke) {
+  static uint32_t next_user = 0;
+  bool any_empty = false;
+  for (uint32_t i = 0; i < 4; ++i) {
+    const uint32_t user = (next_user + i) % 4;
+    const X_RESULT result = is->GetKeystroke(user, flags, keystroke);
+    if (result == X_ERROR_SUCCESS) {
+      next_user = (user + 1) % 4;
+      return result;
+    }
+    any_empty = any_empty || result == X_ERROR_EMPTY;
+  }
+  return any_empty ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
+}
+
 // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputgetkeystroke(v=vs.85).aspx
 u32 XamInputGetKeystroke_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_KEYSTROKE> keystroke) {
   // https://github.com/CodeAsm/ffplay360/blob/master/Common/AtgXime.cpp
@@ -147,14 +169,11 @@ u32 XamInputGetKeystroke_entry(u32 user_index, u32 flags, ppc_ptr_t<X_INPUT_KEYS
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
-  uint32_t actual_user_index = user_index;
-  if ((actual_user_index & 0xFF) == 0xFF || (flags & XINPUT_FLAG_ANY_USER)) {
-    // Always pin user to 0.
-    actual_user_index = 0;
-  }
-
   auto* is = input_system();
-  return is->GetKeystroke(actual_user_index, flags, keystroke);
+  if ((user_index & 0xFF) == 0xFF || (flags & XINPUT_FLAG_ANY_USER)) {
+    return GetKeystrokeAnyUser(is, flags, keystroke);  // PDZ fork: every pad, not user 0's only
+  }
+  return is->GetKeystroke(user_index, flags, keystroke);
 }
 
 // Same as non-ex, just takes a pointer to user index.
@@ -170,13 +189,10 @@ u32 XamInputGetKeystrokeEx_entry(mapped_u32 user_index_ptr, u32 flags,
   }
 
   uint32_t user_index = *user_index_ptr;
-  if ((user_index & 0xFF) == 0xFF || (flags & XINPUT_FLAG_ANY_USER)) {
-    // Always pin user to 0.
-    user_index = 0;
-  }
-
   auto* is = input_system();
-  auto result = is->GetKeystroke(user_index, flags, keystroke);
+  auto result = ((user_index & 0xFF) == 0xFF || (flags & XINPUT_FLAG_ANY_USER))
+                    ? GetKeystrokeAnyUser(is, flags, keystroke)  // PDZ fork: every pad
+                    : is->GetKeystroke(user_index, flags, keystroke);
   if (XSUCCEEDED(result)) {
     *user_index_ptr = keystroke->user_index;
   }

@@ -49,6 +49,9 @@ u32 XamContentGetLicenseMask_entry(mapped_u32 mask_ptr, mapped_void overlapped_p
   }
 }
 
+// xam_user.cpp (PDZ fork): the content XUID for a user index, false = refuse.
+bool xeXamUserContentXuid(uint32_t user_index, uint64_t* xuid);
+
 u32 XamContentResolve_entry(u32 user_index, mapped_void content_data_ptr, mapped_void buffer_ptr,
                             u32 buffer_size, u32 unk1, u32 unk2, u32 unk3) {
   auto content_data = content_data_ptr.as<XCONTENT_DATA*>();
@@ -80,7 +83,8 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
     *buffer_size_ptr = sizeof(XCONTENT_DATA) * items_per_enumerate;
   }
 
-  uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
+  uint64_t xuid = 0;
+  const bool has_storage = xeXamUserContentXuid(user_index, &xuid);  // PDZ fork: per-user folder
 
   auto e = make_object<XStaticEnumerator<XCONTENT_DATA>>(REX_KERNEL_STATE(), items_per_enumerate);
   auto result = e->Initialize(0xFF, 0xFE, 0x20005, 0x20007, 0);
@@ -88,7 +92,7 @@ u32 XamContentCreateEnumerator_entry(u32 user_index, u32 device_id, u32 content_
     return result;
   }
 
-  if (!device_info || device_info->device_id == DummyDeviceId::HDD) {
+  if (has_storage && (!device_info || device_info->device_id == DummyDeviceId::HDD)) {
     // Enumerate user-specific content
     auto content_datas = REX_KERNEL_STATE()->content_manager()->ListContent(
         static_cast<uint32_t>(DummyDeviceId::HDD), xuid, XContentType(uint32_t(content_type)));
@@ -124,9 +128,10 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
                        u32 content_data_size, u32 flags, mapped_u32 disposition_ptr,
                        mapped_u32 license_mask_ptr, u32 cache_size, u64 content_size,
                        mapped_void overlapped_ptr) {
-  // PDZ fork: users 1-3 (local guests, xam_user.cpp) have no storage. Every content root is
-  // user 0's XUID here, so a guest's save would land in user 0's container.
-  if (user_index >= 1 && user_index <= 3) {
+  // PDZ fork: each user's content in its own XUID folder (xeXamUserContentXuid): a connected
+  // local guest (users 1-3) has its own, never user 0's; anyone else of 1-3 is refused.
+  uint64_t xuid = 0;
+  if (!xeXamUserContentXuid(user_index, &xuid)) {
     if (overlapped_ptr) {
       REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(),
                                                       X_ERROR_ACCESS_DENIED);
@@ -134,7 +139,6 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
     }
     return X_ERROR_ACCESS_DENIED;
   }
-  uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
 
   XCONTENT_AGGREGATE_DATA content_data;
   if (content_data_size == sizeof(XCONTENT_DATA)) {
@@ -312,7 +316,15 @@ u32 XamContentGetCreator_entry(u32 user_index, mapped_void content_data_ptr,
                                mapped_void overlapped_ptr) {
   auto result = X_ERROR_SUCCESS;
 
-  uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
+  uint64_t xuid = 0;
+  if (!xeXamUserContentXuid(user_index, &xuid)) {  // PDZ fork: per-user folder
+    if (overlapped_ptr) {
+      REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(),
+                                                      X_ERROR_ACCESS_DENIED);
+      return X_ERROR_IO_PENDING;
+    }
+    return X_ERROR_ACCESS_DENIED;
+  }
   XCONTENT_AGGREGATE_DATA content_data = *content_data_ptr.as<XCONTENT_DATA*>();
 
   bool content_exists = REX_KERNEL_STATE()->content_manager()->ContentExists(xuid, content_data);
@@ -347,7 +359,15 @@ u32 XamContentGetThumbnail_entry(u32 user_index, mapped_void content_data_ptr,
                                  mapped_void overlapped_ptr) {
   assert_not_null(buffer_size_ptr);
   uint32_t buffer_size = *buffer_size_ptr;
-  uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
+  uint64_t xuid = 0;
+  if (!xeXamUserContentXuid(user_index, &xuid)) {  // PDZ fork: per-user folder
+    if (overlapped_ptr) {
+      REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(),
+                                                      X_ERROR_ACCESS_DENIED);
+      return X_ERROR_IO_PENDING;
+    }
+    return X_ERROR_ACCESS_DENIED;
+  }
   XCONTENT_AGGREGATE_DATA content_data = *content_data_ptr.as<XCONTENT_DATA*>();
 
   // Get thumbnail (if it exists).
@@ -382,7 +402,15 @@ u32 XamContentGetThumbnail_entry(u32 user_index, mapped_void content_data_ptr,
 u32 XamContentSetThumbnail_entry(u32 user_index, mapped_void content_data_ptr,
                                  mapped_void buffer_ptr, u32 buffer_size,
                                  mapped_void overlapped_ptr) {
-  uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
+  uint64_t xuid = 0;
+  if (!xeXamUserContentXuid(user_index, &xuid)) {  // PDZ fork: per-user folder
+    if (overlapped_ptr) {
+      REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(),
+                                                      X_ERROR_ACCESS_DENIED);
+      return X_ERROR_IO_PENDING;
+    }
+    return X_ERROR_ACCESS_DENIED;
+  }
   XCONTENT_AGGREGATE_DATA content_data = *content_data_ptr.as<XCONTENT_DATA*>();
 
   // Buffer is PNG data.
@@ -400,7 +428,15 @@ u32 XamContentSetThumbnail_entry(u32 user_index, mapped_void content_data_ptr,
 
 u32 XamContentDelete_entry(u32 user_index, mapped_void content_data_ptr,
                            mapped_void overlapped_ptr) {
-  uint64_t xuid = REX_KERNEL_STATE()->user_profile()->xuid();
+  uint64_t xuid = 0;
+  if (!xeXamUserContentXuid(user_index, &xuid)) {  // PDZ fork: per-user folder
+    if (overlapped_ptr) {
+      REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(),
+                                                      X_ERROR_ACCESS_DENIED);
+      return X_ERROR_IO_PENDING;
+    }
+    return X_ERROR_ACCESS_DENIED;
+  }
   XCONTENT_AGGREGATE_DATA content_data = *content_data_ptr.as<XCONTENT_DATA*>();
 
   auto result = REX_KERNEL_STATE()->content_manager()->DeleteContent(xuid, content_data);

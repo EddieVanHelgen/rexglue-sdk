@@ -72,6 +72,23 @@ static std::string LocalGuestName(uint32_t user_index) {
   return name + suffix;
 }
 
+// PDZ fork (log 104: player 2's profile content "failed to load ... damaged" while guests had no
+// storage): the XUID whose content folder (content_root/<xuid>/...) a user's content calls use.
+// User 0 and the system indices (0xFE / 0xFF) keep user 0's; a connected local guest gets its
+// own XUID, so its saves never touch user 0's folder; users 1-3 that aren't connected guests
+// get none (false: the call is refused).
+bool xeXamUserContentXuid(uint32_t user_index, uint64_t* xuid) {
+  if (user_index >= 1 && user_index <= 3) {
+    if (!IsLocalGuest(user_index)) {
+      return false;
+    }
+    *xuid = LocalGuestXuid(user_index);
+    return *xuid != 0 && *xuid != REX_KERNEL_STATE()->user_profile()->xuid();
+  }
+  *xuid = REX_KERNEL_STATE()->user_profile()->xuid();
+  return true;
+}
+
 i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
   assert_true(type_mask == 1 || type_mask == 2 || type_mask == 3 || type_mask == 4 ||
               type_mask == 7);
