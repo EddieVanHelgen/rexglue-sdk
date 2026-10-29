@@ -54,17 +54,43 @@ class Trace {
     if (event == Event::kHostPresent && !config_dumped_.exchange(true)) {
       DumpConfig();
     }
-    std::string summary;
+    std::string summary, reaction;
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (!file_) {
         return;
       }
       WriteRowLocked(char(event), now, a, b, c, d, e, f);
-      TrackLatencyLocked(event, now, a, b, d, summary);
+      TrackLatencyLocked(event, now, a, b, d, summary, reaction);
+    }
+    if (!reaction.empty()) {
+      REXLOG_INFO("frame_pacing: {}", reaction);
     }
     if (!summary.empty()) {
       REXLOG_INFO("frame_pacing: {}", summary);
+    }
+  }
+
+  // MarkReaction: the newest VdSwap's frame, wherever the pairing has carried it so far.
+  void MarkReaction(uint32_t id, std::chrono::steady_clock::time_point change) {
+    std::call_once(open_once_, [this]() { Open(); });
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!file_ || last_vdswap_ == TimePoint{}) {
+      return;
+    }
+    const auto mark = [&](FrameLatency& frame) {
+      if (frame.vdswap == last_vdswap_ && frame.present == TimePoint{}) {
+        frame.change = change;
+        frame.change_id = id;
+      }
+    };
+    mark(newest_vdswap_);
+    mark(cp_swap_);
+    for (FrameLatency& frame : pending_swaps_) {
+      mark(frame);
+    }
+    for (FrameLatency& frame : frames_) {
+      mark(frame);
     }
   }
 
@@ -91,10 +117,13 @@ class Trace {
     TimePoint present = {};
     uint64_t present_count = 0;
     bool displayed = false;
+    // MarkReaction: the input change this frame is the first reaction to, or empty.
+    TimePoint change = {};
+    uint32_t change_id = 0;
   };
   static constexpr size_t kFrameHistory = 64;
-  // A summary goes to the log every this many presented frames.
-  static constexpr size_t kSummaryFrames = 600;
+  // A summary goes to the log about every this long (600 frames at 60 fps).
+  static constexpr std::chrono::seconds kSummaryPeriod{10};
 
   static int64_t Us(TimePoint from, TimePoint to) {
     return std::chrono::duration_cast<std::chrono::microseconds>(to - from).count();
@@ -109,7 +138,7 @@ class Trace {
   }
 
   void TrackLatencyLocked(Event event, TimePoint now, uint64_t a, uint64_t b, uint64_t d,
-                          std::string& summary_out) {
+                          std::string& summary_out, std::string& reaction_out) {
     switch (event) {
       case Event::kInputPoll:
         last_input_ = now;
@@ -123,6 +152,7 @@ class Trace {
           frame.input_age_us = last_input_age_us_;
         }
         frame.vdswap = now;
+        last_vdswap_ = now;
         newest_vdswap_ = frame;
         newest_vdswap_valid_ = true;
         pending_swaps_[pending_swap_end_++ % kPendingSwaps] = frame;
@@ -164,7 +194,21 @@ class Trace {
           input_age_ms_.push_back(frame.input_age_us / 1000.0);
         }
         vdswap_to_present_ms_.push_back(Us(frame.vdswap, now) / 1000.0);
-        if (vdswap_to_present_ms_.size() >= kSummaryFrames) {
+        if (frame.change != TimePoint{}) {
+          WriteRowLocked('C', now, frame.change_id, Us(frame.change, now), Us(frame.vdswap, now), a,
+                         0, 0);
+          reaction_to_present_ms_.push_back(Us(frame.change, now) / 1000.0);
+          if (reactions_awaiting_refresh_.size() < 16) {
+            reactions_awaiting_refresh_.push_back({frame.change_id, frame.change, now});
+          }
+          reaction_out = fmt::format(
+              "reaction #{} presented: input change -> present {:.2f} ms (VdSwap -> present {:.2f})",
+              frame.change_id, Us(frame.change, now) / 1000.0, Us(frame.vdswap, now) / 1000.0);
+        }
+        if (last_summary_ == TimePoint{}) {
+          last_summary_ = now;
+        } else if (now - last_summary_ >= kSummaryPeriod) {
+          last_summary_ = now;
           summary_out = SummarizeLocked();
         }
       } break;
@@ -193,10 +237,34 @@ class Trace {
             input_to_display_ms_.push_back(Us(frame.input, shown) / 1000.0);
           }
           present_to_display_ms_.push_back(Us(frame.present, shown) / 1000.0);
+          if (frame.change != TimePoint{}) {
+            WriteRowLocked('E', shown, frame.change_id, Us(frame.change, shown),
+                           Us(frame.present, shown), frame.seq, 0, 0);
+            reaction_to_display_ms_.push_back(Us(frame.change, shown) / 1000.0);
+            reaction_out = fmt::format(
+                "reaction #{} on screen: input change -> screen {:.2f} ms (present -> screen {:.2f})",
+                frame.change_id, Us(frame.change, shown) / 1000.0,
+                Us(frame.present, shown) / 1000.0);
+          }
           break;
         }
 #endif
       } break;
+      case Event::kHostVblank:
+        // The first display refresh after a reaction's present (the earliest it can be shown).
+        for (auto it = reactions_awaiting_refresh_.begin(); it != reactions_awaiting_refresh_.end();) {
+          if (it->present > now) {
+            ++it;
+            continue;
+          }
+          reaction_to_refresh_ms_.push_back(Us(it->change, now) / 1000.0);
+          reaction_out = fmt::format(
+              "reaction #{} at the next display refresh: input change -> refresh {:.2f} ms (present -> "
+              "refresh {:.2f})",
+              it->id, Us(it->change, now) / 1000.0, Us(it->present, now) / 1000.0);
+          it = reactions_awaiting_refresh_.erase(it);
+        }
+        break;
       default:
         break;
     }
@@ -224,6 +292,24 @@ class Trace {
     text += ", " + describe("vdswap->present", vdswap_to_present_ms_);
     text += ", " + describe("present->screen", present_to_display_ms_);
     text += ", " + describe("input state age", input_age_ms_);
+    // Reactions (MarkReaction): p50 / p95 / max, kept for the whole run (few per second at most).
+    const auto spread = [](const char* name, std::vector<double> values) {
+      std::sort(values.begin(), values.end());
+      const auto at = [&](size_t percent) {
+        return values[std::min(values.size() - 1, values.size() * percent / 100)];
+      };
+      return fmt::format("{} p50 {:.1f} p95 {:.1f} max {:.1f} (n {})", name, at(50), at(95),
+                         values.back(), values.size());
+    };
+    if (!reaction_to_present_ms_.empty()) {
+      text += "; reaction ms: " + spread("input change->present", reaction_to_present_ms_);
+      if (!reaction_to_refresh_ms_.empty()) {
+        text += ", " + spread("input change->next refresh", reaction_to_refresh_ms_);
+      }
+      if (!reaction_to_display_ms_.empty()) {
+        text += ", " + spread("input change->screen", reaction_to_display_ms_);
+      }
+    }
     return text;
   }
 
@@ -257,7 +343,7 @@ class Trace {
         "d3d12_allow_variable_refresh_rate_and_tearing", "host_present_from_non_ui_thread",
         "d3d12_submit_on_primary_buffer_end", "framerate_limit", "host_vblank_pacing",
         "host_vblank_late_latch_ms", "gpu_max_frames_in_flight", "present_max_frame_latency",
-        "input_backend", "input_poll_on_read"};
+        "input_backend", "input_poll_on_read", "pdz_null_refresh_hz", "pdz_null_present_latency"};
     std::lock_guard<std::mutex> lock(mutex_);
     if (!file_) {
       return;
@@ -295,11 +381,20 @@ class Trace {
     }
     auto last_flush = std::chrono::steady_clock::now();
     uint64_t count = 0;
+    int immediate = 0;  // WaitForVBlank calls in a row that didn't block
     while (running_) {
+      const auto before = std::chrono::steady_clock::now();
       if (!output || FAILED(output->WaitForVBlank())) {
         std::this_thread::sleep_for(std::chrono::milliseconds(8));
-      } else {
+      } else if (std::chrono::steady_clock::now() - before >= std::chrono::microseconds(250)) {
+        immediate = 0;
         Record(Event::kHostVblank, ++count, 0, 0, 0, 0, 0);
+      } else if (++immediate >= 3) {
+        // A display in standby (TV off) answers at once: no vblank to record, and no busy loop
+        // (PDZ log 160: 171 million rows, 5.8 GB in 200 s).
+        std::this_thread::sleep_for(std::chrono::milliseconds(8));
+      } else {
+        Record(Event::kHostVblank, ++count, 0, 0, 0, 0, 0);  // called right at a refresh
       }
       const auto now = std::chrono::steady_clock::now();
       if (now - last_flush > std::chrono::seconds(1)) {
@@ -338,6 +433,17 @@ class Trace {
   std::vector<double> vdswap_to_present_ms_;
   std::vector<double> present_to_display_ms_;
   std::vector<double> input_age_ms_;
+  std::vector<double> reaction_to_present_ms_;
+  std::vector<double> reaction_to_display_ms_;
+  std::vector<double> reaction_to_refresh_ms_;
+  struct AwaitingRefresh {
+    uint32_t id;
+    TimePoint change;
+    TimePoint present;
+  };
+  std::vector<AwaitingRefresh> reactions_awaiting_refresh_;
+  TimePoint last_vdswap_ = {};
+  TimePoint last_summary_ = {};
 #if REX_PLATFORM_WIN32
   TimePoint qpc_origin_ = {};
   int64_t qpc_origin_ticks_ = 0;
@@ -384,6 +490,13 @@ void Record(Event event, uint64_t a, uint64_t b, uint64_t c, uint64_t d, uint64_
     g_totals.gpu_submissions.fetch_add(d, std::memory_order_relaxed);
   }
   Trace::Get().Record(event, a, b, c, d, e, f);
+}
+
+void MarkReaction(uint32_t id, std::chrono::steady_clock::time_point change) {
+  if (!Enabled()) {
+    return;
+  }
+  Trace::Get().MarkReaction(id, change);
 }
 
 void GetTotals(Totals& out) {

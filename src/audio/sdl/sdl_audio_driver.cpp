@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -30,6 +31,20 @@ REXCVAR_DEFINE_DOUBLE(audio_stereo_fold_gain_db, 0.0, "Audio",
                       "(-4.6 dB) so it can't clip. +4.6 undoes that, to match a console's stereo "
                       "level; a soft limiter then rounds off the peaks. 0 = the normalised fold "
                       "(default). Stereo devices only; -12 to +12");
+
+namespace rex::audio {
+namespace {
+std::atomic<uint64_t> g_frames_played{0};
+std::atomic<uint64_t> g_frames_silent{0};
+}  // namespace
+
+OutputClock GetOutputClock() {
+  OutputClock clock;
+  clock.played = g_frames_played.load(std::memory_order_relaxed);
+  clock.silent = g_frames_silent.load(std::memory_order_relaxed);
+  return clock;
+}
+}  // namespace rex::audio
 
 namespace rex::audio::sdl {
 
@@ -198,6 +213,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
         REXAPU_ERROR("SDL_PutAudioStreamData() failed while filling silence: {}", SDL_GetError());
         break;
       }
+      g_frames_silent.fetch_add(1, std::memory_order_relaxed);
       additional_amount -= len;
     } else {
       auto buffer = driver->frames_queued_.front();
@@ -230,6 +246,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
         break;
       }
       driver->frames_unused_.push(buffer);
+      g_frames_played.fetch_add(1, std::memory_order_relaxed);
 
       auto ret = driver->semaphore_->Release(1, nullptr);
       assert_true(ret);

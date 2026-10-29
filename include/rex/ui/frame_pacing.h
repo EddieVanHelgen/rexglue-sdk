@@ -15,6 +15,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 
 namespace rex::ui::frame_pacing {
@@ -50,6 +51,8 @@ enum class Event : char {
   //     d = input state age us, e = input read -> VdSwap us.
   // 'D' a = seq, b = input read -> on screen us, c = present -> on screen us,
   //     d = VdSwap -> on screen us.
+  // 'C' a = reaction id, b = input change -> present us, c = VdSwap -> present us, d = seq.
+  // 'E' a = reaction id, b = input change -> on screen us, c = present -> on screen us, d = seq.
 };
 
 bool Enabled();
@@ -66,6 +69,13 @@ void SetOutputPairing(OutputPairing pairing);
 
 void Record(Event event, uint64_t a = 0, uint64_t b = 0, uint64_t c = 0, uint64_t d = 0,
             uint64_t e = 0, uint64_t f = 0);
+
+// Input-to-screen latency of a reaction (PDZ pdz_latency_log): the title saw an input change at
+// `change` (steady_clock) and the frame of the newest VdSwap is the first whose game state reacts
+// to it (the view turned, the gun fired). The mark goes with that frame through the output pairing
+// to its host present ('C' row) and its refresh on screen ('E' row); one log line at each, and the
+// summary adds "reaction ... p50 / p95 / max". Call it on the thread that called VdSwap, after it.
+void MarkReaction(uint32_t id, std::chrono::steady_clock::time_point change);
 
 // Running totals of the per-frame rows, summed while the trace is on (frame_pacing_log), so a
 // title can report the command processor's time and the host GPU time per frame without parsing

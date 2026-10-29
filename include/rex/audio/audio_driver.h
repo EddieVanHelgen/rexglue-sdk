@@ -11,10 +11,23 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include <rex/kernel.h>
 #include <rex/memory.h>
 
 namespace rex::audio {
+
+// The host audio output's clock, any thread: every frame the device took, counted at the driver's callback. A frame
+// is 256 samples per channel at 48 kHz (5.33 ms). `silent` frames were played as silence because the guest had none
+// queued (an underrun): each one puts the guest's sound 5.33 ms further behind real time. PDZ uses it for the
+// cutscene picture (it follows the sound; game_pace.cpp). All zero with no audio device.
+struct OutputClock {
+  uint64_t played = 0;  // guest frames played
+  uint64_t silent = 0;  // silence frames played in their place
+};
+OutputClock GetOutputClock();
+constexpr double kOutputFrameMs = 256.0 * 1000.0 / 48000.0;
 
 class AudioDriver {
  public:
