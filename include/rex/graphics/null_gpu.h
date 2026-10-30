@@ -69,6 +69,14 @@ PresentPacing GetPresentPacing();
 void SetGuestVblankCapHz(double hz);
 double GuestVblankCapHz();
 
+// The display's exact refresh rate in Hz (e.g. 119.88 or 120.000, from the title's QueryDisplayConfig), 0 = unknown
+// (the default). With host_vblank_pacing the presenter's phase lock then starts from this period and keeps its
+// estimate within 0.05 % of it, instead of starting from EnumDisplaySettings' integer and allowing 1 % (PDZ log 281:
+// the estimate walked to the -1 % bound on a 120.000 Hz G-Sync TV, guest vblanks every 8.25 ms, a frame dropped about
+// once a second). Set it before the GPU setup.
+void SetDisplayRefreshHz(double hz);
+double DisplayRefreshHz();
+
 // Present queue depth override (PDZ stage 2 M5). With host vblank pacing (one Present(1, 0) per guest vblank) and
 // guest vblanks at the display's own rate (120 on a 120 Hz display), presents are as frequent as refreshes: one extra
 // present in a refresh (a late-latched frame after the vblank's own paint while the UI repaints at every tick) leaves

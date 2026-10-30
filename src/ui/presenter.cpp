@@ -1815,7 +1815,8 @@ Microsoft::WRL::ComPtr<IDXGIOutput> Presenter::GetDXGIOutputForMonitor(IDXGIFact
 namespace {
 // How many host vblanks make one guest vblank for host_vblank_pacing, or 0 if
 // the display's refresh rate isn't a whole multiple of the guest's.
-uint32_t GetHostVblankDivisor(IDXGIOutput* output, double& host_period_ns_out) {
+uint32_t GetHostVblankDivisor(IDXGIOutput* output, double& host_period_ns_out, bool& exact_out) {
+  exact_out = false;
   DXGI_OUTPUT_DESC output_desc;
   DEVMODEW display_mode = {};
   display_mode.dmSize = sizeof(display_mode);
@@ -1825,8 +1826,14 @@ uint32_t GetHostVblankDivisor(IDXGIOutput* output, double& host_period_ns_out) {
     REXLOG_WARN("host_vblank_pacing: can't get the display refresh rate, using the timer");
     return 0;
   }
-  // Integer, so 119 for 119.88 Hz - the phase lock refines the period.
-  const double host_hz = double(display_mode.dmDisplayFrequency);
+  // Integer, so 119 for 119.88 Hz - the phase lock refines the period. The title's exact rate
+  // (null_gpu::SetDisplayRefreshHz, PDZ log 281) when it matches this display.
+  double host_hz = double(display_mode.dmDisplayFrequency);
+  const double exact_hz = graphics::null_gpu::DisplayRefreshHz();
+  if (exact_hz > 1.0 && std::abs(exact_hz - host_hz) < 1.5) {
+    host_hz = exact_hz;
+    exact_out = true;
+  }
   // A title's guest vblank rate (null_gpu::SetGuestVblankHz, PDZ stage 2 M5) when set, as the
   // vsync worker paces it; otherwise the video mode's.
   const double vblank_hz_override = graphics::null_gpu::GuestVblankHz();
@@ -1841,8 +1848,15 @@ uint32_t GetHostVblankDivisor(IDXGIOutput* output, double& host_period_ns_out) {
         display_mode.dmDisplayFrequency, guest_hz);
     return 0;
   }
-  REXLOG_INFO("host_vblank_pacing: {} Hz display, guest vblank every {} host vblanks",
-              display_mode.dmDisplayFrequency, divisor);
+  if (exact_out) {
+    REXLOG_INFO(
+        "host_vblank_pacing: {} Hz display, guest vblank every {} host vblanks (exact {:.3f} Hz from "
+        "the title: the period estimate stays within 0.05 % of it)",
+        display_mode.dmDisplayFrequency, divisor, host_hz);
+  } else {
+    REXLOG_INFO("host_vblank_pacing: {} Hz display, guest vblank every {} host vblanks",
+                display_mode.dmDisplayFrequency, divisor);
+  }
   host_period_ns_out = 1e9 / host_hz;
   return uint32_t(divisor);
 }
@@ -1867,6 +1881,7 @@ void Presenter::DXGIUITickThread() {
   IDXGIOutput* grid_output = nullptr;
   uint32_t vblank_divisor = 0;
   double nominal_period_ns = 0.0;
+  bool nominal_exact = false;
   double period_ns = 0.0;
   double anchor_ns = 0.0;
   bool phase_started = false;
@@ -1903,7 +1918,7 @@ void Presenter::DXGIUITickThread() {
     dxgi_ui_tick_lock.unlock();
     if (host_vblank_pacing && dxgi_output.Get() != grid_output) {
       grid_output = dxgi_output.Get();
-      vblank_divisor = GetHostVblankDivisor(grid_output, nominal_period_ns);
+      vblank_divisor = GetHostVblankDivisor(grid_output, nominal_period_ns, nominal_exact);
       reset_phase();
     }
     const bool wait_succeeded = SUCCEEDED(dxgi_output->WaitForVBlank());
@@ -1935,7 +1950,8 @@ void Presenter::DXGIUITickThread() {
             // A phase that keeps drifting the same way means the period is off.
             const double periods = std::max(1.0, (now_ns - last_correction_ns) / period_ns);
             period_ns = std::clamp(period_ns + 0.25 * window_min_error_ns / periods,
-                                   nominal_period_ns * 0.99, nominal_period_ns * 1.01);
+                                   nominal_period_ns * (nominal_exact ? 0.9995 : 0.99),
+                                   nominal_period_ns * (nominal_exact ? 1.0005 : 1.01));
             last_correction_ns = now_ns;
             window_count = 0;
             window_one_period_intervals = 0;

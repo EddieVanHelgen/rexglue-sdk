@@ -18,6 +18,7 @@ std::atomic<double> g_guest_vblank_hz{0.0};
 std::atomic<uint32_t> g_guest_vblank_divider{1};
 std::atomic<uint32_t> g_present_pacing{uint32_t(PresentPacing::kLatch)};
 std::atomic<double> g_guest_vblank_cap_hz{0.0};
+std::atomic<double> g_display_refresh_hz{0.0};
 std::atomic<uint32_t> g_present_max_frame_latency{0};
 std::atomic<bool> g_present_stats_enabled{false};
 std::atomic<WritePointerFilter> g_write_pointer_filter{nullptr};
@@ -90,6 +91,14 @@ void SetGuestVblankCapHz(double hz) {
 
 double GuestVblankCapHz() {
   return g_guest_vblank_cap_hz.load(std::memory_order_relaxed);
+}
+
+void SetDisplayRefreshHz(double hz) {
+  g_display_refresh_hz.store(hz > 1.0 ? hz : 0.0, std::memory_order_release);
+}
+
+double DisplayRefreshHz() {
+  return g_display_refresh_hz.load(std::memory_order_acquire);
 }
 
 void SetPresentMaxFrameLatency(uint32_t frames) {
