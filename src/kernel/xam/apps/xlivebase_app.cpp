@@ -9,6 +9,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <mutex>
+#include <unordered_set>
 #include <rex/kernel/xam/apps/xlivebase_app.h>
 #include <rex/logging.h>
 #include <rex/thread.h>
@@ -78,10 +80,25 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
       return X_E_SUCCESS;
     }
   }
-  REXKRNL_ERROR(
-      "Unimplemented XLIVEBASE message app={:08X}, msg={:08X}, arg1={:08X}, "
-      "arg2={:08X}",
-      app_id(), message, buffer_ptr, buffer_length);
+  // Once per message id at error level, then at debug: a title polling an unimplemented message
+  // every frame (PDZ log 299: msg 0005800E, 64,102 lines in 10 minutes) otherwise writes and
+  // flushes a log line per frame on its own thread.
+  static std::mutex logged_mutex;
+  static std::unordered_set<uint32_t> logged;
+  bool first;
+  {
+    std::lock_guard<std::mutex> lock(logged_mutex);
+    first = logged.insert(message).second;
+  }
+  if (first) {
+    REXKRNL_ERROR(
+        "Unimplemented XLIVEBASE message app={:08X}, msg={:08X}, arg1={:08X}, "
+        "arg2={:08X} (logged once per message; later ones at debug level)",
+        app_id(), message, buffer_ptr, buffer_length);
+  } else {
+    REXKRNL_DEBUG("Unimplemented XLIVEBASE message app={:08X}, msg={:08X}, arg1={:08X}, arg2={:08X}",
+                  app_id(), message, buffer_ptr, buffer_length);
+  }
   return X_E_FAIL;
 }
 
