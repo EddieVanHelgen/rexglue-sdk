@@ -14,10 +14,12 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <utility>
 
 #include <rex/cvar.h>
@@ -212,6 +214,15 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
         const bool host_vblank_pacing =
             presenter_ && ui::Presenter::IsHostVblankPacingEnabled();
         int64_t last_guest_vblank_ns = 0;
+        // kPresent (Deck log: gamescope): the display refreshes seen, those since the last guest vblank, the
+        // current source of guest vblanks (0 = the timer, else every N refreshes) and its reason, the 10 s line.
+        uint64_t present_refresh_seen = null_gpu::DisplayRefreshCount();
+        uint64_t present_refreshes_since_vblank = 0;
+        int64_t present_source = -1;
+        std::string present_timer_reason;
+        uint32_t present_change_lines = 0;
+        int64_t present_stats_ns = 0;
+        uint64_t present_vblanks_refresh = 0, present_vblanks_timer = 0;
         while (vsync_worker_running_) {
           if (!REXCVAR_GET(vsync)) {
             // No vsync: as many vblanks as the guest can take.
@@ -221,6 +232,111 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
           }
           // One guest vblank every N periods (null_gpu::SetGuestVblankDivider; 1 by default).
           const int64_t divider = int64_t(null_gpu::GuestVblankDivider());
+          if (null_gpu::GetPresentPacing() == null_gpu::PresentPacing::kPresent) {
+            // A compositor owns the display (Deck log: gamescope; DXGI reports the panel's native 90 Hz while it
+            // runs at 60): a guest vblank every N display refreshes, as the presenter's waits for room in its
+            // present queue report them - no timer of ours - while presents arrive and N is whole.
+            const int64_t period_ns =
+                int64_t(1000000000.0 / (refresh_rate_hz * chrono::Clock::guest_time_scalar())) * divider;
+            const int64_t now_ns = SteadyNowNs();
+            const int64_t refresh_ns = null_gpu::DisplayRefreshPeriodNs();
+            const int64_t last_refresh_ns = null_gpu::LastDisplayRefreshNs();
+            const int64_t stale_ns = std::max<int64_t>(2 * period_ns, 50'000'000);
+            int64_t source = 0;
+            std::string reason;
+            if (!last_refresh_ns || now_ns - last_refresh_ns > stale_ns) {
+              reason = "no presents (window hidden, painting not started, or a presenter that doesn't report "
+                       "refreshes)";
+            } else if (refresh_ns <= 0) {
+              reason = "the display refresh isn't measured yet";
+            } else {
+              const int64_t n = std::llround(double(period_ns) / double(refresh_ns));
+              if (n >= 1 && n <= 8 && std::llabs(period_ns - n * refresh_ns) * 8 < refresh_ns) {
+                source = n;
+              } else {
+                reason = fmt::format(
+                    "the display refreshes at {:.1f} Hz, not a multiple of the {:.1f} Hz guest rate: {:.0f} fps "
+                    "can't be paced evenly by presents (set the display, e.g. the Steam Deck's Refresh Rate, to "
+                    "a multiple: 60 Hz)",
+                    1e9 / double(refresh_ns), 1e9 / double(period_ns), 1e9 / double(period_ns));
+              }
+            }
+            if (source != present_source || (!source && reason != present_timer_reason)) {
+              if (present_change_lines < 64) {
+                ++present_change_lines;
+                if (source) {
+                  REXGPU_INFO(
+                      "present pacing: guest vblanks every {} display refresh(es) as the presents return (display "
+                      "measured at {:.2f} Hz, guest {:.2f} Hz)",
+                      source, 1e9 / double(refresh_ns), 1e9 / double(period_ns));
+                } else {
+                  REXGPU_WARN("present pacing: guest vblanks on an even {:.2f} Hz timer: {}", 1e9 / double(period_ns),
+                              reason);
+                }
+                if (present_change_lines == 64) {
+                  REXGPU_WARN("present pacing: no more change lines (the 10 s lines go on)");
+                }
+              }
+              present_source = source;
+              present_timer_reason = reason;
+            }
+            if (!present_stats_ns) {
+              present_stats_ns = now_ns;
+            } else if (now_ns - present_stats_ns >= 10'000'000'000) {
+              const null_gpu::PresentIntervalStats st = null_gpu::TakePresentIntervalStats();
+              REXGPU_INFO(
+                  "present pacing: last {:.1f} s: {} presents, interval avg {:.2f} ms p99 {:.1f} ms, {} over 1.5 "
+                  "refreshes, {} queue waits timed out; display {}; guest vblanks {} on refreshes, {} on the timer",
+                  double(now_ns - present_stats_ns) / 1e9, st.intervals, st.avg_ms, st.p99_ms, st.over_1_5,
+                  st.wait_timeouts,
+                  st.refresh_ms > 0.0 ? fmt::format("{:.2f} ms = {:.2f} Hz", st.refresh_ms, 1000.0 / st.refresh_ms)
+                                      : std::string("not measured"),
+                  present_vblanks_refresh, present_vblanks_timer);
+              present_stats_ns = now_ns;
+              present_vblanks_refresh = 0;
+              present_vblanks_timer = 0;
+            }
+            if (source) {
+              const uint64_t count = null_gpu::WaitDisplayRefresh(present_refresh_seen, stale_ns);
+              if (count != present_refresh_seen) {
+                present_refreshes_since_vblank += count - present_refresh_seen;
+                present_refresh_seen = count;
+                if (present_refreshes_since_vblank >= uint64_t(source)) {
+                  // Missed refreshes after a stall are dropped, not delivered in a burst.
+                  present_refreshes_since_vblank = 0;
+                  last_guest_vblank_ns = SteadyNowNs();
+                  ++present_vblanks_refresh;
+                  MarkVblank();
+#if REX_PLATFORM_WIN32
+                  last_frame_time = chrono::Clock::QueryGuestTickCount();
+#endif
+                }
+              }
+              continue;
+            }
+            // The timer, at the guest rate, until presents report usable refreshes again.
+            present_refresh_seen = null_gpu::DisplayRefreshCount();
+            present_refreshes_since_vblank = 0;
+            int64_t target_ns = last_guest_vblank_ns ? last_guest_vblank_ns + period_ns : now_ns;
+            if (target_ns < now_ns - period_ns) {
+              target_ns = now_ns;  // Drop the missed beats after a stall.
+            }
+            for (int64_t remaining_ns; vsync_worker_running_ &&
+                                       (remaining_ns = target_ns - SteadyNowNs()) > 0;) {
+              if (remaining_ns > 2'000'000) {
+                rex::thread::Sleep(std::chrono::microseconds((remaining_ns - 1'500'000) / 1000));
+              } else {
+                rex::thread::MaybeYield();
+              }
+            }
+            last_guest_vblank_ns = target_ns;
+            ++present_vblanks_timer;
+            MarkVblank();
+#if REX_PLATFORM_WIN32
+            last_frame_time = chrono::Clock::QueryGuestTickCount();
+#endif
+            continue;
+          }
           if (null_gpu::GetPresentPacing() == null_gpu::PresentPacing::kImmediate) {
             // Variable refresh rate (PDZ log 272): evenly timed guest vblanks, at the cap while the divider
             // is 1, and no latch - the presenter presents each frame when it is ready and the display times

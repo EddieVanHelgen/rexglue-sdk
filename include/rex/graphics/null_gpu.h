@@ -59,8 +59,18 @@ uint32_t GuestVblankDivider();
 //   latch), and each guest frame is presented as soon as it is ready (sync interval 0, tearing allowed when the swap
 //   chain allows it) so the display (G-Sync / FreeSync) times it. Run the guest under the display's maximum refresh
 //   (SetGuestVblankCapHz) so the display never reaches its ceiling.
+// - kPresent, for a compositor that owns the display (gamescope / Proton on the Steam Deck, where DXGI reports the
+//   panel's native refresh, not the one the compositor runs at, so neither the display lock nor a timer of ours can
+//   match it): the presenter presents every display refresh with Present(1, 0) (no tearing) on a swap chain with a
+//   frame latency waitable object of depth 1, waited for before each paint - the wait returns once the display has
+//   taken the previous frame (FIFO back-pressure), and each return is one display refresh (NotifyDisplayRefresh).
+//   The vsync worker then delivers a guest vblank every N refreshes, N = guest period / measured refresh period
+//   (1 for a 60 Hz guest on a 60 Hz display, 2 on 120 Hz), and no timer of its own. When that isn't a whole number
+//   (a 60 Hz guest on 90 Hz: 60 fps can't be paced evenly by presents) or no presents arrive (window hidden, a
+//   presenter without the notification), it falls back to an even timer at the guest rate. One log line per change
+//   and one every 10 s ("present pacing:").
 // Set it before the GPU setup (the vsync worker and the presenter read it at every vblank / frame).
-enum class PresentPacing : uint32_t { kLatch = 0, kImmediate = 1 };
+enum class PresentPacing : uint32_t { kLatch = 0, kImmediate = 1, kPresent = 2 };
 void SetPresentPacing(PresentPacing pacing);
 PresentPacing GetPresentPacing();
 // kImmediate only: while > 0 and the divider is 1, guest vblanks come at this rate instead of GuestVblankHz (a cap
@@ -113,6 +123,27 @@ void RecordPresent(uint64_t present_us, int64_t latency_wait_us, bool latency_ti
 // Called by the presenter when it creates a swap chain: its waitable depth (0 = none).
 void SetPresentFrameLatencyInUse(uint32_t frames);
 PresentStats TakePresentStats();
+
+// kPresent display refreshes (Deck log: gamescope). The presenter calls NotifyDisplayRefresh after each wait for room
+// in its present queue (timed_out = the wait ran into its bound: not counted as a refresh). The vsync worker reads
+// the count, waits for the next one (WaitDisplayRefresh: returns the count, unchanged on timeout), the measured
+// refresh period (the 25th percentile of the last 32 intervals, so a missed refresh doesn't skew it; 0 = not measured
+// yet) and the time of the last refresh (steady_clock ns, 0 = none).
+void NotifyDisplayRefresh(bool timed_out);
+uint64_t DisplayRefreshCount();
+uint64_t WaitDisplayRefresh(uint64_t seen, int64_t timeout_ns);
+int64_t DisplayRefreshPeriodNs();
+int64_t LastDisplayRefreshNs();
+// The present intervals (between refresh notifications) since the previous take (one reader).
+struct PresentIntervalStats {
+  uint64_t intervals = 0;     // measured intervals
+  double avg_ms = 0.0;        // their mean
+  double p99_ms = 0.0;        // their 99th percentile (0.1 ms steps, 100 ms at most)
+  uint64_t over_1_5 = 0;      // intervals over 1.5 measured refresh periods
+  uint64_t wait_timeouts = 0; // waits that ran into their bound
+  double refresh_ms = 0.0;    // the measured refresh period now (0 = not yet)
+};
+PresentIntervalStats TakePresentIntervalStats();
 
 
 // Ring write pointer hand-off (PDZ stage 2 M5, the title's record thread). A title that does the work a guest draw

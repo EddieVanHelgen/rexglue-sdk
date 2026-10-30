@@ -439,10 +439,15 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
     }
     // A title's override (null_gpu::SetPresentMaxFrameLatency, PDZ stage 2 M5) when the cvar is 0.
     const int32_t max_frame_latency_cvar = REXCVAR_GET(present_max_frame_latency);
+    // Present pacing (a compositor's display, Deck log: gamescope): depth 1, so the wait before each paint returns
+    // once the display has taken the previous frame - one display refresh (null_gpu::NotifyDisplayRefresh).
+    const bool present_paced =
+        rex::graphics::null_gpu::GetPresentPacing() == rex::graphics::null_gpu::PresentPacing::kPresent;
     const int32_t max_frame_latency =
         max_frame_latency_cvar > 0
             ? max_frame_latency_cvar
-            : int32_t(std::min(rex::graphics::null_gpu::PresentMaxFrameLatency(), uint32_t(3)));
+            : present_paced ? 1
+                            : int32_t(std::min(rex::graphics::null_gpu::PresentMaxFrameLatency(), uint32_t(3)));
     if (max_frame_latency > 0 && max_frame_latency_cvar <= 0) {
       REXLOG_INFO(
           "D3D12Presenter: swap chain with a frame latency waitable object of {} (the title's "
@@ -501,6 +506,14 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
           dxgi_supports_tearing_ ? "yes" : "no",
           REXCVAR_GET(d3d12_allow_variable_refresh_rate_and_tearing) ? "true" : "false",
           paint_context_.swap_chain_allows_tearing ? ", ALLOW_TEARING" : "");
+    }
+    if (present_paced) {
+      REXLOG_INFO(
+          "D3D12Presenter: present pacing (a compositor's display): flip discard swap chain {}x{}, frame latency "
+          "waitable object of depth {}{}, every display refresh presented with Present(1, 0) (no tearing); the "
+          "waits report the refreshes that drive the guest vblanks",
+          new_swap_chain_width, new_swap_chain_height, max_frame_latency,
+          max_frame_latency_cvar > 0 ? " (present_max_frame_latency)" : "");
     }
     if (swap_chain_desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
       if (SUCCEEDED(paint_context_.swap_chain->SetMaximumFrameLatency(UINT(max_frame_latency)))) {
@@ -643,6 +656,13 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
                             std::chrono::steady_clock::now() - wait_start)
                             .count();
     }
+  }
+  // Present pacing: the display has taken the previous frame - one display refresh, the guest vblanks' clock.
+  // Without a waitable object, the blocking Present below is the refresh instead.
+  const bool present_paced =
+      rex::graphics::null_gpu::GetPresentPacing() == rex::graphics::null_gpu::PresentPacing::kPresent;
+  if (present_paced && paint_context_.swap_chain_frame_latency_waitable) {
+    rex::graphics::null_gpu::NotifyDisplayRefresh(latency_timeout);
   }
   // Begin the command list with the command allocator not currently potentially
   // used on the GPU.
@@ -1245,7 +1265,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
   const bool trace_pacing = frame_pacing::Enabled();
   const auto present_start = std::chrono::steady_clock::now();
   HRESULT present_result =
-      host_vblank_paced
+      host_vblank_paced || present_paced
           ? paint_context_.swap_chain->Present(1, 0)
           : paint_context_.swap_chain->Present(
                 0, DXGI_PRESENT_RESTART | (paint_context_.swap_chain_allows_tearing
@@ -1284,6 +1304,9 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
       frame_pacing::Record(frame_pacing::Event::kHostDisplay, stats.PresentCount,
                            uint64_t(stats.SyncQPCTime.QuadPart));
     }
+  }
+  if (present_paced && !paint_context_.swap_chain_frame_latency_waitable) {
+    rex::graphics::null_gpu::NotifyDisplayRefresh(false);
   }
   // Even if presentation has failed, work might have been enqueued anyway
   // internally before the failure according to Jesse Natalie from the DirectX

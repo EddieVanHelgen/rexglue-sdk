@@ -5,7 +5,10 @@
 #include <rex/graphics/null_gpu.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <mutex>
 
 namespace rex::graphics::null_gpu {
@@ -160,6 +163,119 @@ PresentStats TakePresentStats() {
   s.latency_wait_max_us = c.latency_wait_max_us.exchange(0, std::memory_order_relaxed);
   s.latency_timeouts = c.latency_timeouts.load(std::memory_order_relaxed);
   s.frame_latency = c.frame_latency.load(std::memory_order_relaxed);
+  return s;
+}
+
+namespace {
+// kPresent display refreshes: written by the presenter's painting thread (one lock per refresh), read by the vsync
+// worker and the stats reader.
+struct DisplayRefreshState {
+  std::mutex mutex;
+  std::condition_variable condition;
+  uint64_t count = 0;
+  int64_t last_ns = 0;
+  int64_t period_ns = 0;
+  std::array<int64_t, 32> recent{};
+  uint32_t recent_count = 0;
+  // Since the previous take: intervals in 0.1 ms steps (the last bucket = 100 ms or more).
+  std::array<uint32_t, 1001> histogram{};
+  uint64_t intervals = 0;
+  int64_t interval_sum_ns = 0;
+  uint64_t over_1_5 = 0;
+  uint64_t wait_timeouts = 0;
+};
+DisplayRefreshState g_refresh;
+std::atomic<uint64_t> g_refresh_count{0};
+std::atomic<int64_t> g_refresh_last_ns{0};
+std::atomic<int64_t> g_refresh_period_ns{0};
+
+int64_t RefreshNowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+}  // namespace
+
+void NotifyDisplayRefresh(bool timed_out) {
+  DisplayRefreshState& r = g_refresh;
+  {
+    std::lock_guard<std::mutex> lock(r.mutex);
+    if (timed_out) {
+      ++r.wait_timeouts;
+      return;
+    }
+    const int64_t now_ns = RefreshNowNs();
+    // A gap of a quarter second or more is a pause (window hidden, painting stopped), not pacing.
+    if (r.last_ns && now_ns - r.last_ns < 250'000'000) {
+      const int64_t interval_ns = now_ns - r.last_ns;
+      r.recent[r.recent_count % r.recent.size()] = interval_ns;
+      if (++r.recent_count % r.recent.size() == 0) {
+        // The 25th percentile: a refresh missed now and then (an interval of two) doesn't move it.
+        std::array<int64_t, 32> sorted = r.recent;
+        std::nth_element(sorted.begin(), sorted.begin() + sorted.size() / 4, sorted.end());
+        r.period_ns = sorted[sorted.size() / 4];
+        g_refresh_period_ns.store(r.period_ns, std::memory_order_relaxed);
+      }
+      ++r.histogram[size_t(std::clamp<int64_t>(interval_ns / 100'000, 0, 1000))];
+      ++r.intervals;
+      r.interval_sum_ns += interval_ns;
+      if (r.period_ns && interval_ns * 2 > r.period_ns * 3) {
+        ++r.over_1_5;
+      }
+    }
+    r.last_ns = now_ns;
+    ++r.count;
+    g_refresh_last_ns.store(now_ns, std::memory_order_relaxed);
+    g_refresh_count.store(r.count, std::memory_order_release);
+  }
+  r.condition.notify_all();
+}
+
+uint64_t DisplayRefreshCount() {
+  return g_refresh_count.load(std::memory_order_acquire);
+}
+
+uint64_t WaitDisplayRefresh(uint64_t seen, int64_t timeout_ns) {
+  DisplayRefreshState& r = g_refresh;
+  std::unique_lock<std::mutex> lock(r.mutex);
+  r.condition.wait_for(lock, std::chrono::nanoseconds(std::max<int64_t>(timeout_ns, 0)),
+                       [&]() { return r.count != seen; });
+  return r.count;
+}
+
+int64_t DisplayRefreshPeriodNs() {
+  return g_refresh_period_ns.load(std::memory_order_relaxed);
+}
+
+int64_t LastDisplayRefreshNs() {
+  return g_refresh_last_ns.load(std::memory_order_relaxed);
+}
+
+PresentIntervalStats TakePresentIntervalStats() {
+  DisplayRefreshState& r = g_refresh;
+  PresentIntervalStats s;
+  std::lock_guard<std::mutex> lock(r.mutex);
+  s.intervals = r.intervals;
+  s.avg_ms = r.intervals ? double(r.interval_sum_ns) / double(r.intervals) / 1e6 : 0.0;
+  if (r.intervals) {
+    const uint64_t rank = (r.intervals * 99 + 99) / 100;  // the ceiling of 99 %
+    uint64_t seen = 0;
+    for (size_t i = 0; i < r.histogram.size(); ++i) {
+      seen += r.histogram[i];
+      if (seen >= rank) {
+        s.p99_ms = double(i + 1) / 10.0;
+        break;
+      }
+    }
+  }
+  s.over_1_5 = r.over_1_5;
+  s.wait_timeouts = r.wait_timeouts;
+  s.refresh_ms = double(r.period_ns) / 1e6;
+  r.histogram.fill(0);
+  r.intervals = 0;
+  r.interval_sum_ns = 0;
+  r.over_1_5 = 0;
+  r.wait_timeouts = 0;
   return s;
 }
 

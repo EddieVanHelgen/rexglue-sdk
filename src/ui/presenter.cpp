@@ -520,9 +520,23 @@ void Presenter::PaintFromUIThread(bool force_paint) {
       // in a way so that the UI won't be stealing all the remaining GPU
       // resources if it's repainted continuously, and the window system itself
       // doesn't limit the frame rate.
-      WaitForUITickFromUIThread();
+      // Present pacing (null_gpu::PresentPacing::kPresent, Deck log: gamescope): the presenter's wait for room in
+      // its present queue (depth 1) limits it to the display's refresh instead - DXGI's vblank waits follow the
+      // panel's native rate under a compositor, not the one it runs at - and each paint that reported a refresh
+      // asks for the next one, so every refresh is presented (the newest guest frame, or the same one again) and
+      // the guest vblanks the vsync worker counts from those refreshes keep coming.
+      const bool present_paced = graphics::null_gpu::GetPresentPacing() ==
+                                 graphics::null_gpu::PresentPacing::kPresent;
+      const uint64_t refreshes_before = present_paced ? graphics::null_gpu::DisplayRefreshCount() : 0;
+      if (!present_paced) {
+        WaitForUITickFromUIThread();
+      }
 
       paint_result = PaintAndPresent(draw_ui);
+      if (present_paced && paint_result == PaintResult::kPresented &&
+          graphics::null_gpu::DisplayRefreshCount() != refreshes_before) {
+        request_repaint_immediately = true;
+      }
       if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
         // Request another PaintFromUIThread which will try to recover from the
         // outdated connection in the next frame (not immediately, so the
@@ -1441,7 +1455,9 @@ Presenter::PaintMode Presenter::GetDesiredPaintModeFromUIThread(bool is_paintabl
     // lifecycle.
     return PaintMode::kNone;
   }
-  if (!REXCVAR_GET(host_present_from_non_ui_thread) || REXCVAR_GET(host_vblank_pacing)) {
+  // Present pacing: the UI thread presents every display refresh (PaintFromUIThread).
+  if (!REXCVAR_GET(host_present_from_non_ui_thread) || REXCVAR_GET(host_vblank_pacing) ||
+      graphics::null_gpu::GetPresentPacing() == graphics::null_gpu::PresentPacing::kPresent) {
     return PaintMode::kUIThreadOnRequest;
   }
   if (surface_paint_connection_has_implicit_vsync_) {
@@ -1541,8 +1557,11 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
 bool Presenter::IsHostVblankPacingEnabled() { return REXCVAR_GET(host_vblank_pacing); }
 
 bool Presenter::IsHostVblankPacingActive() const {
-  // Immediate present pacing (VRR): every frame is presented when ready, nothing is latched.
-  if (graphics::null_gpu::GetPresentPacing() == graphics::null_gpu::PresentPacing::kImmediate) {
+  // Immediate present pacing (VRR): every frame is presented when ready, nothing is latched. Present pacing (a
+  // compositor's display): every refresh is presented, the newest frame each time, nothing is latched either.
+  const graphics::null_gpu::PresentPacing pacing = graphics::null_gpu::GetPresentPacing();
+  if (pacing == graphics::null_gpu::PresentPacing::kImmediate ||
+      pacing == graphics::null_gpu::PresentPacing::kPresent) {
     return false;
   }
   // Latches stop without vsync or while the guest isn't running.
@@ -1866,7 +1885,8 @@ void Presenter::DXGIUITickThread() {
   // Immediate present pacing (VRR, null_gpu::SetPresentPacing) times guest vblanks without the display: no lock.
   const bool host_vblank_pacing =
       REXCVAR_GET(host_vblank_pacing) &&
-      graphics::null_gpu::GetPresentPacing() != graphics::null_gpu::PresentPacing::kImmediate;
+      graphics::null_gpu::GetPresentPacing() != graphics::null_gpu::PresentPacing::kImmediate &&
+      graphics::null_gpu::GetPresentPacing() != graphics::null_gpu::PresentPacing::kPresent;
   if (host_vblank_pacing) {
     // Fewer late wake-ups make for a quicker, tighter phase lock.
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
