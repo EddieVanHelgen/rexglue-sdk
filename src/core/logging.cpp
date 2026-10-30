@@ -58,6 +58,7 @@ namespace {
 std::vector<LogCategoryEntry> g_registry;
 spdlog::sink_ptr g_console_sink;
 spdlog::sink_ptr g_file_sink;
+std::filesystem::path g_log_file_path;  // the file sink's path (CurrentLogFilePath)
 spdlog::sink_ptr g_early_sink;
 std::vector<spdlog::sink_ptr> g_extra_sinks;
 bool g_early_initialized = false;
@@ -272,6 +273,11 @@ void InitLogging(const LogConfig& config) {
     sink->set_level(spdlog::level::trace);
     sink->set_pattern(config.file_pattern);
     g_file_sink = sink;
+    std::error_code abs_ec;
+    g_log_file_path = std::filesystem::absolute(resolved_path, abs_ec);
+    if (abs_ec) {
+      g_log_file_path = resolved_path;
+    }
   }
 
   g_extra_sinks = config.extra_sinks;
@@ -324,6 +330,11 @@ void ShutdownLogging() {
   g_extra_sinks.clear();
   g_initialized = false;
   g_early_initialized = false;
+}
+
+std::filesystem::path CurrentLogFilePath() {
+  std::lock_guard lock(g_mutex);
+  return g_log_file_path;
 }
 
 void FlushLogging() {

@@ -79,6 +79,12 @@ void ShutdownLogging();
 void FlushLogging();
 
 /**
+ * The absolute path of the log file the file sink writes (e.g. <exe>/logs/app_007.log), or an empty path when
+ * logging to a file isn't set up. A title can put its own output files next to it.
+ */
+std::filesystem::path CurrentLogFilePath();
+
+/**
  * Register a new log category at runtime.
  *
  * The returned handle can be used with REXLOG_CAT_* macros and all
