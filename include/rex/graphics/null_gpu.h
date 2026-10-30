@@ -52,6 +52,23 @@ double GuestVblankHz();
 void SetGuestVblankDivider(uint32_t divider);
 uint32_t GuestVblankDivider();
 
+// Present pacing with host_vblank_pacing (PDZ log 272: 120 fps judder on a G-Sync display).
+// - kLatch (the default, as before): each guest vblank (phase-locked to the display's vblank when that locks, else an
+//   even timer) latches the newest guest frame, which is presented with Present(1, 0) at the next host vblank.
+// - kImmediate, for a variable refresh rate display: guest vblanks come from an even timer only (no display lock, no
+//   latch), and each guest frame is presented as soon as it is ready (sync interval 0, tearing allowed when the swap
+//   chain allows it) so the display (G-Sync / FreeSync) times it. Run the guest under the display's maximum refresh
+//   (SetGuestVblankCapHz) so the display never reaches its ceiling.
+// Set it before the GPU setup (the vsync worker and the presenter read it at every vblank / frame).
+enum class PresentPacing : uint32_t { kLatch = 0, kImmediate = 1 };
+void SetPresentPacing(PresentPacing pacing);
+PresentPacing GetPresentPacing();
+// kImmediate only: while > 0 and the divider is 1, guest vblanks come at this rate instead of GuestVblankHz (a cap
+// under a VRR display's maximum, e.g. 117 on 120 Hz); dividers above 1 keep GuestVblankHz / divider (60 at 120 / 2).
+// 0 = no cap (the default). Read at every vblank: it may change at any time, from any thread.
+void SetGuestVblankCapHz(double hz);
+double GuestVblankCapHz();
+
 // Present queue depth override (PDZ stage 2 M5). With host vblank pacing (one Present(1, 0) per guest vblank) and
 // guest vblanks at the display's own rate (120 on a 120 Hz display), presents are as frequent as refreshes: one extra
 // present in a refresh (a late-latched frame after the vblank's own paint while the UI repaints at every tick) leaves

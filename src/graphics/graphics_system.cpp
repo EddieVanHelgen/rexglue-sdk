@@ -221,6 +221,34 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
           }
           // One guest vblank every N periods (null_gpu::SetGuestVblankDivider; 1 by default).
           const int64_t divider = int64_t(null_gpu::GuestVblankDivider());
+          if (null_gpu::GetPresentPacing() == null_gpu::PresentPacing::kImmediate) {
+            // Variable refresh rate (PDZ log 272): evenly timed guest vblanks, at the cap while the divider
+            // is 1, and no latch - the presenter presents each frame when it is ready and the display times
+            // it. Locking to the display's vblank would follow our own presents under VRR.
+            const double cap_hz = null_gpu::GuestVblankCapHz();
+            const double hz = divider == 1 && cap_hz > 0.0 ? cap_hz : refresh_rate_hz / double(divider);
+            const int64_t period_ns =
+                int64_t(1000000000.0 / (hz * chrono::Clock::guest_time_scalar()));
+            const int64_t now_ns = SteadyNowNs();
+            int64_t target_ns = last_guest_vblank_ns ? last_guest_vblank_ns + period_ns : now_ns;
+            if (target_ns < now_ns - period_ns) {
+              target_ns = now_ns;  // Drop the missed beats after a stall.
+            }
+            for (int64_t remaining_ns; vsync_worker_running_ &&
+                                       (remaining_ns = target_ns - SteadyNowNs()) > 0;) {
+              if (remaining_ns > 2'000'000) {
+                rex::thread::Sleep(std::chrono::microseconds((remaining_ns - 1'500'000) / 1000));
+              } else {
+                rex::thread::MaybeYield();
+              }
+            }
+            last_guest_vblank_ns = target_ns;
+            MarkVblank();
+#if REX_PLATFORM_WIN32
+            last_frame_time = chrono::Clock::QueryGuestTickCount();
+#endif
+            continue;
+          }
           if (host_vblank_pacing) {
             const int64_t now_ns = SteadyNowNs();
             int64_t target_ns;

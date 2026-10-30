@@ -489,6 +489,19 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
     paint_context_.swap_chain_height = new_swap_chain_height;
     paint_context_.swap_chain_allows_tearing =
         (swap_chain_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
+    if (rex::graphics::null_gpu::GetPresentPacing() ==
+        rex::graphics::null_gpu::PresentPacing::kImmediate) {
+      // PDZ log 272: VRR needs a flip-model swap chain presented with tearing allowed (and borderless fullscreen).
+      REXLOG_INFO(
+          "D3D12Presenter: immediate present pacing (VRR): flip discard swap chain {}x{}, tearing {} "
+          "(DXGI support {}, d3d12_allow_variable_refresh_rate_and_tearing {}): each frame presented "
+          "when ready with Present(0{})",
+          new_swap_chain_width, new_swap_chain_height,
+          paint_context_.swap_chain_allows_tearing ? "allowed" : "NOT allowed",
+          dxgi_supports_tearing_ ? "yes" : "no",
+          REXCVAR_GET(d3d12_allow_variable_refresh_rate_and_tearing) ? "true" : "false",
+          paint_context_.swap_chain_allows_tearing ? ", ALLOW_TEARING" : "");
+    }
     if (swap_chain_desc.Flags & DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) {
       if (SUCCEEDED(paint_context_.swap_chain->SetMaximumFrameLatency(UINT(max_frame_latency)))) {
         paint_context_.swap_chain_frame_latency_waitable =

@@ -1541,6 +1541,10 @@ void Presenter::UpdateSurfacePaintConnectionFromUIThread(bool* repaint_needed_ou
 bool Presenter::IsHostVblankPacingEnabled() { return REXCVAR_GET(host_vblank_pacing); }
 
 bool Presenter::IsHostVblankPacingActive() const {
+  // Immediate present pacing (VRR): every frame is presented when ready, nothing is latched.
+  if (graphics::null_gpu::GetPresentPacing() == graphics::null_gpu::PresentPacing::kImmediate) {
+    return false;
+  }
   // Latches stop without vsync or while the guest isn't running.
   const int64_t last_latch_ns = host_vblank_last_latch_ns_.load(std::memory_order_relaxed);
   return last_latch_ns && std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1845,7 +1849,10 @@ uint32_t GetHostVblankDivisor(IDXGIOutput* output, double& host_period_ns_out) {
 }  // namespace
 
 void Presenter::DXGIUITickThread() {
-  const bool host_vblank_pacing = REXCVAR_GET(host_vblank_pacing);
+  // Immediate present pacing (VRR, null_gpu::SetPresentPacing) times guest vblanks without the display: no lock.
+  const bool host_vblank_pacing =
+      REXCVAR_GET(host_vblank_pacing) &&
+      graphics::null_gpu::GetPresentPacing() != graphics::null_gpu::PresentPacing::kImmediate;
   if (host_vblank_pacing) {
     // Fewer late wake-ups make for a quicker, tighter phase lock.
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
