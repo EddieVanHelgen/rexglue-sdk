@@ -98,6 +98,19 @@ struct RecompilerConfig {
   bool nonVolatileRegistersAsLocalVariables = false;
   bool generateExceptionHandlers = false;  ///< Generate SEH exception handler wrappers
 
+  // === Code generation speed-ups (all off by default: off reproduces the output byte for byte) ===
+  /// inline_save_restore: a bl / b to a register save / restore helper (__savegprlr_N,
+  /// __restgprlr_N, __savefpr_N, __restfpr_N, __savevmx_N, __restvmx_N) emits that helper's own
+  /// generated statements in place of the call. Same stores / loads in the same order.
+  bool inlineSaveRestore = false;
+  /// stack_direct_access: D-form loads / stores whose base register is r1 (the stack pointer) use
+  /// REX_SLOAD_* / REX_SSTORE_*, which skip REX_PHYS_HOST_OFFSET: guest stacks live in
+  /// 0x70000000-0x7F000000, so r1 + a 16-bit displacement is never in the 0xE0000000 view.
+  bool stackDirectAccess = false;
+  /// stack_direct_access_verify: the REX_S* macros keep the offset and report any address at or
+  /// above 0xE0000000 (rex_codegen_stack_fault); proof runs only.
+  bool stackDirectAccessVerify = false;
+
   // === Analysis tuning (optional) ===
   uint32_t maxJumpExtension = 65536;  ///< Max bytes to extend function for jump table targets
   uint32_t dataRegionThreshold = 16;  ///< Consecutive invalid instructions to mark as data region

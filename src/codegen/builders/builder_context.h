@@ -325,6 +325,10 @@ struct BuilderContext {
    */
   void emit_load_d_form(const char* load_macro, const char* dest_type, bool check_mmio = true);
 
+  /// inline_save_restore: emits a register save / restore helper's generated body in place of a
+  /// call to it. False (nothing emitted) when the helper is not a straight-line body.
+  bool emit_inline_helper(const FunctionNode& helper);
+
   /**
    * @brief Emit load with X-form addressing: rD = LOAD(rA + rB)
    * @param load_macro The load macro name

@@ -357,6 +357,32 @@ void emit_print(std::string& out, fmt::format_string<Args...> fmt, Args&&... arg
   fmt::vformat_to(std::back_inserter(out), fmt.get(), fmt::make_format_args(args...));
 }
 
+// stack_direct_access: a D / DS-form load or store (operands rD/rS, displacement, rA) whose base
+// register rA is r1. Guest stacks are allocated in 0x70000000-0x7F000000 (XThread, the CRT's threads
+// and fibers, MmCreateKernelStack), so r1 plus a signed 16-bit displacement never reaches the
+// 0xE0000000 view that REX_PHYS_HOST_OFFSET exists for.
+bool IsStackDForm(const ppc_insn& insn) {
+  static const std::unordered_set<std::string_view> kDForm = {
+      "lbz",  "lbzu",  "lhz",  "lhzu", "lha",   "lhau",  "lwz",  "lwzu",  "lwa",
+      "ld",   "ldu",   "stb",  "stbu", "sth",   "sthu",  "stw",  "stwu",  "std",
+      "stdu", "lfs",   "lfsu", "lfd",  "lfdu",  "stfs",  "stfsu", "stfd", "stfdu"};
+  return insn.opcode && kDForm.contains(insn.opcode->name) && insn.operands[2] == 1;
+}
+
+// Rewrites this instruction's REX_LOAD_U* / REX_STORE_U* (not the REX_MM_* MMIO forms) to the
+// stack forms REX_SLOAD_U* / REX_SSTORE_U*.
+void UseStackMacros(std::string& body, size_t from) {
+  static constexpr std::pair<std::string_view, std::string_view> kSwaps[] = {
+      {"REX_LOAD_U", "REX_SLOAD_U"}, {"REX_STORE_U", "REX_SSTORE_U"}};
+  for (const auto& [from_text, to_text] : kSwaps) {
+    size_t pos = from;
+    while ((pos = body.find(from_text, pos)) != std::string::npos) {
+      body.replace(pos, from_text.size(), to_text);
+      pos += to_text.size();
+    }
+  }
+}
+
 }  // namespace
 
 std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
@@ -600,10 +626,13 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
           builderCtx.emit_mid_asm_hook();
         }
 
+        const size_t insnStart = body.size();
         if (!DispatchInstruction(id, builderCtx)) {
           REXCODEGEN_WARN("Unrecognized instruction at 0x{:X}: {}", blockBase, insn.opcode->name);
           allRecompiled = false;
         }
+        if (ctx.config.stackDirectAccess && IsStackDForm(insn))
+          UseStackMacros(body, insnStart);
 
         // Check for mid-asm hook AFTER instruction
         if (hookIt != ctx.config.midAsmHooks.end() && hookIt->second.afterInstruction) {

@@ -144,7 +144,22 @@ extern PPCFuncMapping PPCFuncMappings[];
 #define REX_STORE_U32(x, y) (*(volatile u32*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap32(y))
 #define REX_STORE_U64(x, y) (*(volatile u64*)(base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) = __builtin_bswap64(y))
 
-#define REX_MEMORY_SIZE 0x100000000ull
+{% if config_flags.stack_direct_access %}// stack_direct_access: r1-based D-form loads / stores. Guest stacks are in 0x70000000-0x7F000000,
+// below the 0xE0000000 view, so these skip REX_PHYS_HOST_OFFSET.
+{% if config_flags.stack_direct_access_verify %}extern "C" void rex_codegen_stack_fault(u32 addr);
+#define REX_STACK_ADDR(x) \
+  ((u32)(x) >= 0xE0000000u ? (rex_codegen_stack_fault((u32)(x)), base + (u32)(x) + REX_PHYS_HOST_OFFSET(x)) : base + (u32)(x))
+{% else %}#define REX_STACK_ADDR(x) (base + (u32)(x))
+{% endif %}#define REX_SLOAD_U8(x) (*(volatile u8*)REX_STACK_ADDR(x))
+#define REX_SLOAD_U16(x) __builtin_bswap16(*(volatile u16*)REX_STACK_ADDR(x))
+#define REX_SLOAD_U32(x) __builtin_bswap32(*(volatile u32*)REX_STACK_ADDR(x))
+#define REX_SLOAD_U64(x) __builtin_bswap64(*(volatile u64*)REX_STACK_ADDR(x))
+#define REX_SSTORE_U8(x, y)  (*(volatile u8*)REX_STACK_ADDR(x) = (y))
+#define REX_SSTORE_U16(x, y) (*(volatile u16*)REX_STACK_ADDR(x) = __builtin_bswap16(y))
+#define REX_SSTORE_U32(x, y) (*(volatile u32*)REX_STACK_ADDR(x) = __builtin_bswap32(y))
+#define REX_SSTORE_U64(x, y) (*(volatile u64*)REX_STACK_ADDR(x) = __builtin_bswap64(y))
+
+{% endif %}#define REX_MEMORY_SIZE 0x100000000ull
 
 //=============================================================================
 // MMIO

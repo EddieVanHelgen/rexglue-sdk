@@ -172,6 +172,80 @@ const CallTarget* BuilderContext::findCallTarget(uint32_t site) const {
   return nullptr;
 }
 
+// The register save / restore helpers (straight-line runs of stores or loads that end in blr).
+static bool IsSaveRestoreHelperName(const std::string& name) {
+  static constexpr std::string_view kPrefixes[] = {"__savegprlr_", "__restgprlr_", "__savefpr_",
+                                                   "__restfpr_",   "__savevmx_",   "__restvmx_"};
+  for (auto prefix : kPrefixes) {
+    if (name.compare(0, prefix.size(), prefix) == 0)
+      return true;
+  }
+  return false;
+}
+
+// inline_save_restore: emit a save / restore helper's own generated body (the same builders' output
+// for its instructions) in place of the call, minus its prologue and its final blr's `return;`. Only
+// for a body that is one straight run: no labels, no other return, no locals but temp / ea / vTemp
+// (merged into this function's). Returns false (the caller emits the call) for anything else.
+bool BuilderContext::emit_inline_helper(const FunctionNode& helper) {
+  if (!IsSaveRestoreHelperName(helper.name()))
+    return false;
+
+  const std::string text = helper.emitCpp(emitCtx);
+  const std::string head = fmt::format("DEFINE_REX_FUNC({}) {{\n\tREX_FUNC_PROLOGUE();\n",
+                                       helper.name());
+  static constexpr std::string_view kTail = "\treturn;\n}\n\n";
+  if (text.compare(0, head.size(), head) != 0 || text.size() < head.size() + kTail.size() ||
+      text.compare(text.size() - kTail.size(), kTail.size(), kTail) != 0) {
+    return false;
+  }
+
+  std::string_view rest(text);
+  rest = rest.substr(head.size(), rest.size() - head.size() - kTail.size());
+
+  bool needTemp = false, needEa = false, needVTemp = false;
+  std::string inlined;
+  size_t pos = 0;
+  while (pos < rest.size()) {
+    size_t eol = rest.find('\n', pos);
+    if (eol == std::string_view::npos)
+      return false;
+    std::string_view line = rest.substr(pos, eol - pos);
+    pos = eol + 1;
+    if (line == "\tPPCRegister temp{};") {
+      needTemp = true;
+      continue;
+    }
+    if (line == "\tuint32_t ea{};") {
+      needEa = true;
+      continue;
+    }
+    if (line == "\tPPCVRegister vTemp{};") {
+      needVTemp = true;
+      continue;
+    }
+    // A label, a return, a nested block or any other declaration: not a straight-line body.
+    if (line.empty() || line[0] != '\t' || line.find("return") != std::string_view::npos ||
+        line.find('{') != std::string_view::npos || line.find("PPCRegister ") != std::string_view::npos ||
+        line.find("PPCVRegister ") != std::string_view::npos ||
+        line.find("PPCCRRegister ") != std::string_view::npos) {
+      return false;
+    }
+    inlined.append(line);
+    inlined += '\n';
+  }
+
+  if (needTemp)
+    locals.temp = true;
+  if (needEa)
+    locals.ea = true;
+  if (needVTemp)
+    locals.v_temp = true;
+  println("\t// inlined {}", helper.name());
+  out += inlined;
+  return true;
+}
+
 void BuilderContext::emit_function_call(uint32_t address) {
   const auto& cfg = config();
 
@@ -205,6 +279,11 @@ void BuilderContext::emit_function_call(uint32_t address) {
       if (cfg.nonVolatileRegistersAsLocalVariables &&
           (name.find("__rest") == 0 || name.find("__save") == 0)) {
         // print nothing - these are handled by local variable tracking
+        return;
+      }
+
+      // inline_save_restore: the helper's own generated statements in place of the call.
+      if (cfg.inlineSaveRestore && emit_inline_helper(*targetFn)) {
         return;
       }
 

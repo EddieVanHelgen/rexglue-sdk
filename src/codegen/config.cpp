@@ -116,6 +116,12 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
             hasBool("non_volatile_as_local"), "non_volatile_as_local");
   MergeBool(cfg.generateExceptionHandlers, toml["generate_exception_handlers"].value_or(false),
             hasBool("generate_exception_handlers"), "generate_exception_handlers");
+  MergeBool(cfg.inlineSaveRestore, toml["inline_save_restore"].value_or(false),
+            hasBool("inline_save_restore"), "inline_save_restore");
+  MergeBool(cfg.stackDirectAccess, toml["stack_direct_access"].value_or(false),
+            hasBool("stack_direct_access"), "stack_direct_access");
+  MergeBool(cfg.stackDirectAccessVerify, toml["stack_direct_access_verify"].value_or(false),
+            hasBool("stack_direct_access_verify"), "stack_direct_access_verify");
   if (hasBool("is_dll")) {
     cfg.isDll = toml["is_dll"].value_or(false);
   }

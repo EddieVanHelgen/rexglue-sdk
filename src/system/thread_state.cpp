@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <cstdlib>
 
 #include <rex/assert.h>
@@ -59,3 +60,16 @@ uint32_t ThreadState::GetThreadID() {
 }
 
 }  // namespace rex::runtime
+
+// Codegen option stack_direct_access_verify (proof runs only): the generated REX_SLOAD_* /
+// REX_SSTORE_* macros call this for an r1-based guest access at or above 0xE0000000, which the
+// option assumes never happens (guest stacks are in 0x70000000-0x7F000000). The access itself still
+// goes through REX_PHYS_HOST_OFFSET, as without the option.
+extern "C" void rex_codegen_stack_fault(uint32_t addr) {
+  static std::atomic<uint32_t> faults{0};
+  const uint32_t n = ++faults;
+  if (n <= 16 || (n & (n - 1)) == 0) {
+    REXLOG_ERROR("codegen stack_direct_access_verify: r1-based access at 0x{:08X} ({} so far)", addr,
+                 n);
+  }
+}
