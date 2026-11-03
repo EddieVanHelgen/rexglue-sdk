@@ -45,6 +45,7 @@ set(REXSYSTEM_SOURCES
     gpu_plugin_loader.cpp
     thread.cpp
     thread_state.cpp
+    lockstep.cpp
     xex_module.cpp
 )
 

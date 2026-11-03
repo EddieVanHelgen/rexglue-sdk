@@ -122,6 +122,23 @@ void ApplyToml(const toml::table& toml, RecompilerConfig& cfg, const std::string
             hasBool("stack_direct_access"), "stack_direct_access");
   MergeBool(cfg.stackDirectAccessVerify, toml["stack_direct_access_verify"].value_or(false),
             hasBool("stack_direct_access_verify"), "stack_direct_access_verify");
+  MergeBool(cfg.localRegisters, toml["local_registers"].value_or(false),
+            hasBool("local_registers"), "local_registers");
+  MergeBool(cfg.localRegistersVerify, toml["local_registers_verify"].value_or(false),
+            hasBool("local_registers_verify"), "local_registers_verify");
+  if (auto v = toml["local_registers_max_work"].value<int64_t>()) {
+    cfg.localRegistersMaxWork = static_cast<uint32_t>(*v);
+  }
+  auto readAddressSet = [&](const char* key, std::unordered_set<uint32_t>& dst) {
+    if (auto* arr = toml[key].as_array()) {
+      for (const auto& el : *arr) {
+        if (auto a = el.value<int64_t>())
+          dst.insert(static_cast<uint32_t>(*a));
+      }
+    }
+  };
+  readAddressSet("local_registers_functions", cfg.localRegistersFunctions);
+  readAddressSet("local_registers_exclude", cfg.localRegistersExclude);
   if (hasBool("is_dll")) {
     cfg.isDll = toml["is_dll"].value_or(false);
   }

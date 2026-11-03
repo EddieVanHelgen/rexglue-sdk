@@ -14,8 +14,12 @@
 #include "builders.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <cctype>
+#include <set>
 #include <unordered_set>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -383,6 +387,460 @@ void UseStackMacros(std::string& body, size_t from) {
   }
 }
 
+// local_registers (docs/CODEGEN_SPEEDUP.md stage 2): the function's guest registers as C++ locals.
+//
+// The body is generated exactly as without the option (every register as ctx.X); this pass then
+// rewrites it so the registers the body names (rN, fN, vN, crN, ctr, xer, reserved) are locals:
+//   - loaded from ctx at entry (PPCRegister r3 = ctx.r3; ...),
+//   - written back to ctx (REX_SO) before every call, indirect call, trap and MMIO access and
+//     before every return, and reloaded (REX_SI) after every call that returns here,
+//   so at every point where anything outside this function can look at the context (a callee, a
+//   hook that replaced a callee, the kernel, the MMIO handler, a trap handler) it holds exactly
+//   what the ctx-only code would have left there. Between those points the compiler keeps the
+//   registers in host registers; it drops the stores and loads at a sync point that change
+//   nothing (a register not written since the last sync, a reload overwritten before any read).
+//   lr, fpscr, msr and the rest of the context stay in ctx.
+// A function stays as generated (returns false) when anything in it could see the context other
+// than through those points: setjmp / longjmp (env = ctx), SEH scopes, mid-asm hooks, a register
+// shared with a funclet, or any whole-ctx use the pass does not recognise.
+
+enum class LocalizeSkip {
+  None,
+  NotSelected,
+  NoRegisters,
+  Atomics,
+  NotVerifiable,
+  Excluded,
+  Helper,
+  Seh,
+  SharedRegisters,
+  MidAsmHook,
+  SetJmp,
+  Unrecognised,
+  TooBig,
+  Count
+};
+
+const char* LocalizeSkipName(LocalizeSkip why) {
+  switch (why) {
+    case LocalizeSkip::None: return "localized";
+    case LocalizeSkip::NotSelected: return "not selected";
+    case LocalizeSkip::Excluded: return "excluded";
+    case LocalizeSkip::Helper: return "save / restore helper";
+    case LocalizeSkip::Seh: return "SEH scopes";
+    case LocalizeSkip::SharedRegisters: return "shares registers";
+    case LocalizeSkip::MidAsmHook: return "mid-asm hook";
+    case LocalizeSkip::SetJmp: return "setjmp";
+    case LocalizeSkip::Unrecognised: return "unrecognised context use";
+    case LocalizeSkip::TooBig: return "over local_registers_max_work";
+    case LocalizeSkip::NoRegisters: return "no registers";
+    case LocalizeSkip::Atomics: return "atomics / MMIO / global lock";
+    case LocalizeSkip::NotVerifiable: return "not lockstep-verifiable";
+    default: return "?";
+  }
+}
+
+std::atomic<uint32_t> g_localizeCounts[static_cast<size_t>(LocalizeSkip::Count)];
+
+void CountLocalize(LocalizeSkip why) {
+  g_localizeCounts[static_cast<size_t>(why)].fetch_add(1, std::memory_order_relaxed);
+}
+
+struct LocalizeResult {
+  std::string decls;   // local declarations (after the function's own locals)
+  std::string body;    // rewritten body
+  std::string macros;  // #define REX_SO / REX_SI (before DEFINE_REX_FUNC)
+  size_t registers = 0;
+  size_t syncPoints = 0;
+};
+
+// Parses a localizable register name at s[pos] (after "ctx."); returns its length or 0.
+static size_t ParseLocalField(std::string_view s, size_t pos) {
+  auto digits = [&](size_t p, size_t maxDigits) {
+    size_t n = 0;
+    while (p + n < s.size() && n < maxDigits && s[p + n] >= '0' && s[p + n] <= '9')
+      ++n;
+    return n;
+  };
+  auto boundary = [&](size_t end) {
+    return end >= s.size() || !(std::isalnum(static_cast<unsigned char>(s[end])) || s[end] == '_');
+  };
+  auto rest = s.substr(pos);
+  size_t len = 0;
+  if (rest.starts_with("reserved")) {
+    len = 8;
+  } else if (rest.starts_with("ctr")) {
+    len = 3;
+  } else if (rest.starts_with("xer")) {
+    len = 3;
+  } else if (rest.starts_with("cr")) {
+    size_t d = digits(pos + 2, 1);
+    len = d ? 2 + d : 0;
+  } else if (!rest.empty() && (rest[0] == 'r' || rest[0] == 'f' || rest[0] == 'v')) {
+    size_t d = digits(pos + 1, 3);
+    len = d ? 1 + d : 0;
+  }
+  return (len && boundary(pos + len)) ? len : 0;
+}
+
+static LocalizeSkip LocalizeRegisters(std::string_view body, LocalizeResult& res) {
+  // Reservations, atomics, MMIO and the global lock: left as generated (synchronisation code the
+  // lockstep verify cannot replay; none of it is hot).
+  for (std::string_view k : {"compare_exchange", "REX_MM_", "GLOBAL_LOCK", "*(uint32_t*)REX_RAW_ADDR",
+                             "*(uint64_t*)REX_RAW_ADDR"}) {
+    if (body.find(k) != std::string_view::npos)
+      return LocalizeSkip::Atomics;
+  }
+  // 1. Rename ctx.<register> to <register>, collect the set, and refuse any other whole-ctx use
+  //    except the recognised call forms (checked per line below).
+  std::set<std::string> used;
+  std::string renamed;
+  renamed.reserve(body.size());
+  for (size_t i = 0; i < body.size();) {
+    if (body.compare(i, 4, "ctx.") == 0 &&
+        (i == 0 || !(std::isalnum(static_cast<unsigned char>(body[i - 1])) || body[i - 1] == '_'))) {
+      size_t len = ParseLocalField(body, i + 4);
+      if (len) {
+        std::string name(body.substr(i + 4, len));
+        used.insert(name);
+        renamed += name;
+        i += 4 + len;
+        continue;
+      }
+    }
+    renamed += body[i++];
+  }
+  if (used.empty())
+    return LocalizeSkip::NoRegisters;
+
+  // 2. Line pass: sync points.
+  std::string out;
+  out.reserve(renamed.size() + renamed.size() / 8);
+  std::vector<std::string_view> lines;
+  for (size_t p = 0; p < renamed.size();) {
+    size_t e = renamed.find('\n', p);
+    if (e == std::string::npos)
+      e = renamed.size();
+    lines.emplace_back(std::string_view(renamed).substr(p, e - p));
+    p = e + 1;
+  }
+
+  auto indentOf = [](std::string_view l) {
+    size_t n = 0;
+    while (n < l.size() && l[n] == '\t')
+      ++n;
+    return l.substr(0, n);
+  };
+  auto isIdent = [](char c) { return std::isalnum(static_cast<unsigned char>(c)) || c == '_'; };
+  // "name(ctx, base);" on its own line.
+  auto isDirectCall = [&](std::string_view t) {
+    static constexpr std::string_view kArgs = "(ctx, base);";
+    if (t.size() <= kArgs.size() || !t.ends_with(kArgs))
+      return false;
+    auto name = t.substr(0, t.size() - kArgs.size());
+    if (name.empty() || std::isdigit(static_cast<unsigned char>(name[0])))
+      return false;
+    for (char c : name)
+      if (!isIdent(c))
+        return false;
+    return true;
+  };
+  auto hasWholeCtx = [&](std::string_view l) {
+    // "ctx" as a whole identifier, not followed by '.'.
+    for (size_t p = l.find("ctx"); p != std::string_view::npos; p = l.find("ctx", p + 3)) {
+      bool before = p == 0 || !isIdent(l[p - 1]);
+      bool after = p + 3 >= l.size() || (!isIdent(l[p + 3]) && l[p + 3] != '.');
+      if (before && after)
+        return true;
+    }
+    return false;
+  };
+
+  size_t sync = 0;
+  for (size_t li = 0; li < lines.size(); ++li) {
+    std::string_view l = lines[li];
+    std::string_view ind = indentOf(l);
+    std::string_view t = l.substr(ind.size());
+    bool lastLine = li + 1 == lines.size();
+
+    if (t.starts_with("//") || t.empty()) {
+      out.append(l);
+      if (!lastLine)
+        out += '\n';
+      continue;
+    }
+
+    // An MMIO access: the handler gets a coherent context (write back), and the line itself may
+    // write a local (an MMIO load), so no reload after it.
+    if (t.find("REX_MM_") != std::string_view::npos) {
+      ++sync;
+      out.append(ind).append("REX_SO();\n").append(l);
+      if (!lastLine)
+        out += '\n';
+      continue;
+    }
+
+    bool call = isDirectCall(t) || t.starts_with("REX_CALL_INDIRECT_FUNC(");
+    if (call) {
+      ++sync;
+      out.append(ind).append("REX_SO();\n");
+      out.append(l).append("\n");
+      // A tail call: the next statement is this block's return. The callee left ctx as the caller
+      // will see it; nothing of ours runs after it.
+      if (li + 1 < lines.size() && lines[li + 1] == std::string(ind) + "return;") {
+        out.append(lines[li + 1]);
+        ++li;
+        if (li + 1 != lines.size())
+          out += '\n';
+        continue;
+      }
+      out.append(ind).append("REX_SI();");
+      if (!lastLine)
+        out += '\n';
+      continue;
+    }
+
+    // if (cond) ppc_trap(ctx, base, N);
+    if (auto p = t.find(") ppc_trap(ctx, base, "); t.starts_with("if (") && p != std::string_view::npos &&
+                                                     t.ends_with(");")) {
+      ++sync;
+      out.append(ind).append(t.substr(0, p + 2)).append("{ REX_SO(); ");
+      out.append(t.substr(p + 2)).append(" REX_SI(); }");
+      if (!lastLine)
+        out += '\n';
+      continue;
+    }
+    if (t.starts_with("ppc_trap(ctx, base, ") && t.ends_with(");")) {
+      ++sync;
+      out.append(ind).append("REX_SO();\n").append(l).append("\n").append(ind).append("REX_SI();");
+      if (!lastLine)
+        out += '\n';
+      continue;
+    }
+
+    // Returns: "return;" or "if (cond) return;".
+    if (t == "return;") {
+      out.append(ind).append("{ REX_SO(); return; }");
+      if (!lastLine)
+        out += '\n';
+      continue;
+    }
+    if (t.starts_with("if (") && t.ends_with(") return;")) {
+      out.append(ind).append(t.substr(0, t.size() - 7)).append("{ REX_SO(); return; }");
+      if (!lastLine)
+        out += '\n';
+      continue;
+    }
+
+    // The function's closing brace: falling off the end (after a call to a function that does not
+    // return) still writes back.
+    if (l == "}" && li + 2 >= lines.size()) {
+      out.append("\tREX_SO();\n}");
+      if (!lastLine)
+        out += '\n';
+      continue;
+    }
+
+    // Anything else that names the whole context, or returns some other way: not ours to rewrite.
+    if (hasWholeCtx(t) || t.find("return") != std::string_view::npos || t.find("ppc_") != std::string_view::npos)
+      return LocalizeSkip::Unrecognised;
+
+    out.append(l);
+    if (!lastLine)
+      out += '\n';
+  }
+
+  // 3. Declarations and the two sync macros.
+  auto typeOf = [](const std::string& n) -> const char* {
+    if (n == "xer")
+      return "PPCXERRegister";
+    if (n.starts_with("cr"))
+      return "PPCCRRegister";
+    if (n[0] == 'v')
+      return "PPCVRegister";
+    return "PPCRegister";
+  };
+  // Context order (r, then ctr / xer / reserved, cr, f, v), for readable output.
+  std::vector<std::string> order;
+  auto addIf = [&](const std::string& n) {
+    if (used.contains(n))
+      order.push_back(n);
+  };
+  for (int i = 0; i < 32; ++i)
+    addIf(fmt::format("r{}", i));
+  addIf("ctr");
+  addIf("xer");
+  addIf("reserved");
+  for (int i = 0; i < 8; ++i)
+    addIf(fmt::format("cr{}", i));
+  for (int i = 0; i < 32; ++i)
+    addIf(fmt::format("f{}", i));
+  for (int i = 0; i < 128; ++i)
+    addIf(fmt::format("v{}", i));
+  if (order.size() != used.size())
+    return LocalizeSkip::Unrecognised;  // a name outside the register file (e.g. r32)
+
+  if (!renamed.empty() && renamed.back() == '\n')
+    out += '\n';
+
+  res.decls.clear();
+  for (const auto& n : order)
+    res.decls += fmt::format("\t{} {} = ctx.{};\n", typeOf(n), n, n);
+  res.macros = "#define REX_SO() do {";
+  for (const auto& n : order)
+    res.macros += fmt::format(" ctx.{} = {};", n, n);
+  res.macros += " } while (0)\n#define REX_SI() do {";
+  for (const auto& n : order)
+    res.macros += fmt::format(" {} = ctx.{};", n, n);
+  res.macros += " } while (0)\n";
+  res.body = std::move(out);
+  res.registers = order.size();
+  res.syncPoints = sync;
+  return LocalizeSkip::None;
+}
+
+
+// local_registers_verify: the two bodies of a verified function (rex/ppc/lockstep.h).
+namespace lv {
+
+std::vector<std::string_view> SplitLines(std::string_view s) {
+  std::vector<std::string_view> lines;
+  for (size_t p = 0; p < s.size();) {
+    size_t e = s.find('\n', p);
+    if (e == std::string_view::npos)
+      e = s.size();
+    lines.push_back(s.substr(p, e - p));
+    p = e + 1;
+  }
+  return lines;
+}
+
+std::string_view Indent(std::string_view l) {
+  size_t n = 0;
+  while (n < l.size() && l[n] == '\t')
+    ++n;
+  return l.substr(0, n);
+}
+
+// "name(ctx, base);" -> name, or empty.
+std::string_view DirectCallee(std::string_view t) {
+  static constexpr std::string_view kArgs = "(ctx, base);";
+  if (t.size() <= kArgs.size() || !t.ends_with(kArgs))
+    return {};
+  auto name = t.substr(0, t.size() - kArgs.size());
+  if (std::isdigit(static_cast<unsigned char>(name[0])))
+    return {};
+  for (char c : name)
+    if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '_'))
+      return {};
+  return name;
+}
+
+void ReplaceAll(std::string& s, std::string_view from, std::string_view to) {
+  for (size_t pos = 0; (pos = s.find(from, pos)) != std::string::npos; pos += to.size())
+    s.replace(pos, from.size(), to);
+}
+
+// The ctx-only body with the real side's checkpoints: a REX_LVR_CALL before and REX_LVR_RET after every
+// call, indirect call and trap, REX_LVR_EXIT before every return, and every store logged.
+std::string InstrumentReal(std::string_view body) {
+  std::string out;
+  auto lines = SplitLines(body);
+  for (size_t i = 0; i < lines.size(); ++i) {
+    std::string_view l = lines[i];
+    std::string_view ind = Indent(l);
+    std::string_view t = l.substr(ind.size());
+    std::string line;
+    if (auto callee = DirectCallee(t); !callee.empty()) {
+      line = fmt::format("{0}REX_LVR_CALL(\"{1}\", 0);\n{2}\n{0}REX_LVR_RET();", ind, callee, l);
+    } else if (t.starts_with("REX_CALL_INDIRECT_FUNC(") && t.ends_with(");")) {
+      auto arg = t.substr(23, t.size() - 23 - 2);
+      line = fmt::format("{0}REX_LVR_CALL(nullptr, {1});\n{2}\n{0}REX_LVR_RET();", ind, arg, l);
+    } else if (t.starts_with("ppc_trap(ctx, base, ") && t.ends_with(");")) {
+      auto arg = t.substr(20, t.size() - 20 - 2);
+      line = fmt::format("{0}REX_LVR_CALL(\"ppc_trap\", {1});\n{2}\n{0}REX_LVR_RET();", ind, arg, l);
+    } else if (auto p = t.find(") ppc_trap(ctx, base, "); t.starts_with("if (") && p != std::string_view::npos &&
+                                                         t.ends_with(");")) {
+      auto call = t.substr(p + 2);
+      auto arg = call.substr(20, call.size() - 20 - 2);
+      line = fmt::format("{}{}{{ REX_LVR_CALL(\"ppc_trap\", {}); {} REX_LVR_RET(); }}", ind, t.substr(0, p + 2), arg,
+                         call);
+    } else if (t == "return;") {
+      line = fmt::format("{}{{ REX_LVR_EXIT(); return; }}", ind);
+    } else if (t.starts_with("if (") && t.ends_with(") return;")) {
+      line = fmt::format("{}{}{{ REX_LVR_EXIT(); return; }}", ind, t.substr(0, t.size() - 7));
+    } else if (l == "}" && i + 2 >= lines.size()) {
+      line = "\tREX_LVR_EXIT();\n}";
+    } else {
+      line = std::string(l);
+    }
+    out += line;
+    if (i + 1 < lines.size())
+      out += '\n';
+  }
+  if (!body.empty() && body.back() == '\n')
+    out += '\n';
+  ReplaceAll(out, "REX_LOAD_U", "REX_LVR_LOAD_U");
+  ReplaceAll(out, "REX_SLOAD_U", "REX_LVR_SLOAD_U");
+  ReplaceAll(out, "REX_STORE_U", "REX_LVR_STORE_U");
+  ReplaceAll(out, "REX_SSTORE_U", "REX_LVR_SSTORE_U");
+  ReplaceAll(out, "simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR(", "REX_LVR_STORE16((");
+  ReplaceAll(out, "simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(", "REX_LVR_LOAD16((");
+  ReplaceAll(out, "memset((void*)REX_RAW_ADDR(", "REX_LVR_ZERO((");
+  ReplaceAll(out, "REX_QUERY_TIMEBASE()", "REX_LVR_TIMEBASE()");
+  if (out.find("REX_RAW_ADDR") != std::string::npos)
+    return {};  // a raw access the recording cannot see
+  return out;
+}
+
+// The localized body against the shadow's memory and call macros. Empty when some memory access has
+// no shadow form (it could not be replayed).
+std::string ShadowRewrite(std::string_view body) {
+  std::string out;
+  auto lines = SplitLines(body);
+  for (size_t i = 0; i < lines.size(); ++i) {
+    std::string_view l = lines[i];
+    std::string_view ind = Indent(l);
+    std::string_view t = l.substr(ind.size());
+    if (auto callee = DirectCallee(t); !callee.empty()) {
+      out += fmt::format("{}REX_LVS_CALL(\"{}\", 0);", ind, callee);
+    } else if (t.starts_with("REX_CALL_INDIRECT_FUNC(") && t.ends_with(");")) {
+      out += fmt::format("{}REX_LVS_CALL(nullptr, {});", ind, t.substr(23, t.size() - 23 - 2));
+    } else {
+      out += l;
+    }
+    if (i + 1 < lines.size())
+      out += '\n';
+  }
+  if (!body.empty() && body.back() == '\n')
+    out += '\n';
+  // Traps, in either form: ppc_trap(ctx, base, N) -> REX_LVS_CALL("ppc_trap", N)
+  for (size_t pos = 0; (pos = out.find("ppc_trap(ctx, base, ", pos)) != std::string::npos;) {
+    size_t close = out.find(')', pos);
+    std::string arg = out.substr(pos + 20, close - pos - 20);
+    std::string repl = fmt::format("REX_LVS_CALL(\"ppc_trap\", {})", arg);
+    out.replace(pos, close + 1 - pos, repl);
+    pos += repl.size();
+  }
+  ReplaceAll(out, "REX_LOAD_U", "REX_LVS_LOAD_U");
+  ReplaceAll(out, "REX_SLOAD_U", "REX_LVS_SLOAD_U");
+  ReplaceAll(out, "REX_STORE_U", "REX_LVS_STORE_U");
+  ReplaceAll(out, "REX_SSTORE_U", "REX_LVS_SSTORE_U");
+  ReplaceAll(out, "simde_mm_store_si128((simde__m128i*)REX_RAW_ADDR(", "REX_LVS_STORE16((");
+  ReplaceAll(out, "simde_mm_load_si128((simde__m128i*)REX_RAW_ADDR(", "REX_LVS_LOAD16((");
+  ReplaceAll(out, "memset((void*)REX_RAW_ADDR(", "REX_LVS_ZERO((");
+  ReplaceAll(out, "REX_QUERY_TIMEBASE()", "REX_LVS_TIMEBASE()");
+  if (out.find("REX_RAW_ADDR") != std::string::npos || out.find("(ctx, base)") != std::string::npos ||
+      out.find("REX_CALL_INDIRECT_FUNC") != std::string::npos)
+    return {};
+  return out;
+}
+
+}  // namespace lv
+
+std::string InstrumentReal(std::string_view body) { return lv::InstrumentReal(body); }
+std::string ShadowRewrite(std::string_view body) { return lv::ShadowRewrite(body); }
+
 }  // namespace
 
 std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
@@ -532,6 +990,7 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
 
   std::string body;
   body.reserve(4096);
+  bool anyMidAsmHook = false;
 
   ppc_insn insn;
   std::unordered_set<size_t> emittedLabels;
@@ -616,6 +1075,8 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
         auto hookIt = ctx.config.midAsmHooks.find(blockBase);
         bool hasHookBefore =
             (hookIt != ctx.config.midAsmHooks.end() && !hookIt->second.afterInstruction);
+        if (hookIt != ctx.config.midAsmHooks.end())
+          anyMidAsmHook = true;
 
         // Dispatch instruction to builder
         int id = insn.opcode->id;
@@ -679,42 +1140,116 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
     emit_println(body, "}}\n");
   }
 
+  // --- local_registers: the guest registers as C++ locals (stage 2) ---
+  LocalizeResult localized;
+  bool isLocalized = false;
+  std::string verifyRealBody;  // local_registers_verify: the instrumented ctx-only body
+  if (ctx.config.localRegisters) {
+    const auto& cfg = ctx.config;
+    const uint32_t addr = static_cast<uint32_t>(base());
+    LocalizeSkip why = LocalizeSkip::None;
+    if (!cfg.localRegistersFunctions.empty() && !cfg.localRegistersFunctions.contains(addr))
+      why = LocalizeSkip::NotSelected;
+    else if (cfg.localRegistersExclude.contains(addr))
+      why = LocalizeSkip::Excluded;
+    else if (name.starts_with("__save") || name.starts_with("__rest"))
+      why = LocalizeSkip::Helper;
+    else if (generateSeh)
+      why = LocalizeSkip::Seh;
+    else if (sharesRegisters())
+      why = LocalizeSkip::SharedRegisters;
+    else if (anyMidAsmHook)
+      why = LocalizeSkip::MidAsmHook;
+    else if (localVariables.env)
+      why = LocalizeSkip::SetJmp;
+    else if ((why = LocalizeRegisters(body, localized)) != LocalizeSkip::None)
+      ;
+    else if (cfg.localRegistersMaxWork &&
+             localized.registers * (localized.syncPoints + 1) > cfg.localRegistersMaxWork)
+      why = LocalizeSkip::TooBig;
+    // Only what the lockstep verify can check is localized, in every build (so a timing build runs
+    // exactly the set a verify build proved).
+    if (why == LocalizeSkip::None) {
+      std::string real = InstrumentReal(body);
+      std::string shadow = ShadowRewrite(localized.body);
+      if (real.empty() || shadow.empty()) {
+        why = LocalizeSkip::NotVerifiable;
+      } else if (cfg.localRegistersVerify) {
+        verifyRealBody = std::move(real);
+        localized.body = std::move(shadow);
+      }
+    }
+    CountLocalize(why);
+    if (why == LocalizeSkip::None) {
+      isLocalized = true;
+      body = std::move(localized.body);
+      out = localized.macros + out;
+    } else if (why != LocalizeSkip::NotSelected) {
+      REXCODEGEN_DEBUG("local_registers: 0x{:08X} stays as generated ({})", addr,
+                       LocalizeSkipName(why));
+    }
+  }
+
   // --- Emit local variable declarations, then body ---
+  std::string decls;
   if (localVariables.ctr)
-    emit_println(out, "\tPPCRegister ctr{{}};");
+    emit_println(decls, "\tPPCRegister ctr{{}};");
   if (localVariables.xer)
-    emit_println(out, "\tPPCXERRegister xer{{}};");
+    emit_println(decls, "\tPPCXERRegister xer{{}};");
   if (localVariables.reserved)
-    emit_println(out, "\tPPCRegister reserved{{}};");
+    emit_println(decls, "\tPPCRegister reserved{{}};");
 
   for (size_t i = 0; i < 8; i++) {
     if (localVariables.cr[i])
-      emit_println(out, "\tPPCCRRegister cr{}{{}};", i);
+      emit_println(decls, "\tPPCCRRegister cr{}{{}};", i);
   }
 
   for (size_t i = 0; i < 32; i++) {
     if (localVariables.r[i])
-      emit_println(out, "\tPPCRegister r{}{{}};", i);
+      emit_println(decls, "\tPPCRegister r{}{{}};", i);
   }
 
   for (size_t i = 0; i < 32; i++) {
     if (localVariables.f[i])
-      emit_println(out, "\tPPCRegister f{}{{}};", i);
+      emit_println(decls, "\tPPCRegister f{}{{}};", i);
   }
 
   for (size_t i = 0; i < 128; i++) {
     if (localVariables.v[i])
-      emit_println(out, "\tPPCVRegister v{}{{}};", i);
+      emit_println(decls, "\tPPCVRegister v{}{{}};", i);
   }
 
   if (localVariables.env)
-    emit_println(out, "\tPPCContext env{{}};");
+    emit_println(decls, "\tPPCContext env{{}};");
   if (localVariables.temp)
-    emit_println(out, "\tPPCRegister temp{{}};");
+    emit_println(decls, "\tPPCRegister temp{{}};");
   if (localVariables.v_temp)
-    emit_println(out, "\tPPCVRegister vTemp{{}};");
+    emit_println(decls, "\tPPCVRegister vTemp{{}};");
   if (localVariables.ea)
-    emit_println(out, "\tuint32_t ea{{}};");
+    emit_println(decls, "\tuint32_t ea{{}};");
+
+  // local_registers_verify: __imp__ is the ctx-only body, instrumented, and the localized body is
+  // the lockstep shadow beside it.
+  if (isLocalized && !verifyRealBody.empty()) {
+    const std::string shadowName = fmt::format("__lvshadow__{}", name);
+    const size_t defineAt = out.find("DEFINE_REX_FUNC(");
+    out.insert(defineAt,
+               fmt::format("static void {}(PPCContext& __restrict ctx, uint8_t* base);\n", shadowName));
+    out += fmt::format("\tREX_LV_ENTER({}, 0x{:08X});\n", shadowName, static_cast<uint32_t>(base()));
+    out += decls;
+    out += verifyRealBody;
+    out += fmt::format("static void {}(PPCContext& __restrict ctx, uint8_t* base) {{\n\tREX_FUNC_PROLOGUE();\n",
+                       shadowName);
+    out += decls;
+    out += localized.decls;
+    out += body;
+    out += "#undef REX_SO\n#undef REX_SI\n\n";
+    return out;
+  }
+
+  out += decls;
+  if (isLocalized)
+    out += localized.decls;
 
   // If SEH, emit SEH_TRY and indent body
   if (generateSeh) {
@@ -731,6 +1266,8 @@ std::string FunctionNode::emitCpp(const EmitContext& ctx) const {
   } else {
     out += body;
   }
+  if (isLocalized)
+    out += "#undef REX_SO\n#undef REX_SI\n\n";
 
   return out;
 }
@@ -1365,6 +1902,24 @@ void FunctionGraph::notifyFunctionAdded(FunctionNode* newFunction) {
       node->tryResolveAgainst(newFunction);
     }
   }
+}
+
+// local_registers: one summary line per codegen run (how many functions were localized, and why
+// the others stayed as generated).
+void LogLocalRegistersSummary() {
+  uint32_t total = 0;
+  for (const auto& c : g_localizeCounts)
+    total += c.load();
+  if (!total)
+    return;
+  std::string why;
+  for (size_t i = 1; i < static_cast<size_t>(LocalizeSkip::Count); ++i) {
+    uint32_t n = g_localizeCounts[i].load();
+    if (n)
+      why += fmt::format("{}{} {}", why.empty() ? "" : ", ", n, LocalizeSkipName(static_cast<LocalizeSkip>(i)));
+  }
+  REXCODEGEN_INFO("local_registers: {} functions localized; stayed as generated: {}",
+                  g_localizeCounts[0].load(), why.empty() ? "none" : why);
 }
 
 }  // namespace rex::codegen

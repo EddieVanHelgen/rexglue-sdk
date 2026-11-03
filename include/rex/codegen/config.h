@@ -110,6 +110,22 @@ struct RecompilerConfig {
   /// stack_direct_access_verify: the REX_S* macros keep the offset and report any address at or
   /// above 0xE0000000 (rex_codegen_stack_fault); proof runs only.
   bool stackDirectAccessVerify = false;
+  /// local_registers: a function's guest registers (rN, fN, vN, crN, ctr, xer, reserved) as C++
+  /// locals, written back to ctx before every call / trap / MMIO access / return and reloaded
+  /// after every call, so the context is exactly as without the option wherever anything outside
+  /// the function can see it. Functions with setjmp / longjmp, SEH, mid-asm hooks, shared
+  /// registers, atomics, the global lock or MMIO stay as generated.
+  bool localRegisters = false;
+  /// local_registers_functions: when non-empty, only these function addresses are localized.
+  std::unordered_set<uint32_t> localRegistersFunctions;
+  /// local_registers_exclude: never localized.
+  std::unordered_set<uint32_t> localRegistersExclude;
+  /// local_registers_max_work: skip a function whose registers x sync points exceeds this (compile
+  /// time); 0 = no limit.
+  uint32_t localRegistersMaxWork = 0;
+  /// local_registers_verify: proof builds. Each localized function's __imp__ is its ctx-only body,
+  /// instrumented, with the localized body beside it as a lockstep shadow (rex/ppc/lockstep.h).
+  bool localRegistersVerify = false;
 
   // === Analysis tuning (optional) ===
   uint32_t maxJumpExtension = 65536;  ///< Max bytes to extend function for jump table targets

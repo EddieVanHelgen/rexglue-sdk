@@ -91,6 +91,7 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
       {"non_volatile_as_local", cfg.nonVolatileRegistersAsLocalVariables},
       {"stack_direct_access", cfg.stackDirectAccess},
       {"stack_direct_access_verify", cfg.stackDirectAccessVerify},
+      {"local_registers_verify", cfg.localRegisters && cfg.localRegistersVerify},
   };
 
   return {
@@ -112,6 +113,8 @@ nlohmann::json buildTemplateData(const rex::codegen::CodegenContext& ctx,
 }  // namespace
 
 namespace rex::codegen {
+
+void LogLocalRegistersSummary();  // function_graph.cpp
 
 bool IsGeneratedOutputName(std::string_view filename, std::string_view projectName) {
   auto dot = filename.rfind('.');
@@ -276,6 +279,7 @@ bool CodegenWriter::write(bool force) {
     references.push_back(referenced);
   }
   emitCtx.referenced = nullptr;
+  LogLocalRegistersSummary();
 
   auto partition = OutputPartition::Load(outputPath / kPartitionFileName);
   auto buckets = partition.Assign(sizes, maxFileBytes);
