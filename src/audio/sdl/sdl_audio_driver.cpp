@@ -18,6 +18,7 @@
 #include <rex/audio/conversion.h>
 #include <rex/audio/downmix.h>
 #include <rex/audio/flags.h>
+#include <rex/audio/host_stream.h>
 #include <rex/audio/sdl/sdl_audio_driver.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
@@ -209,6 +210,10 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
         sdl_callback_count++;
       }
       std::memset(data, 0, len);
+      // A host stream (host_stream.h) keeps playing through a guest underrun.
+      if (!REXCVAR_GET(audio_mute)) {
+        host_stream::MixInto(data, channel_samples_, driver->sdl_device_channels_, gain);
+      }
       if (!SDL_PutAudioStreamData(stream, data, len)) {
         REXAPU_ERROR("SDL_PutAudioStreamData() failed while filling silence: {}", SDL_GetError());
         break;
@@ -239,6 +244,8 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
             assert_unhandled_case(driver->sdl_device_channels_);
             break;
         }
+        // A host stream over the guest's mix (host_stream.h), under the same output gain.
+        host_stream::MixInto(data, channel_samples_, driver->sdl_device_channels_, gain);
       }
       if (!SDL_PutAudioStreamData(stream, data, len)) {
         REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
