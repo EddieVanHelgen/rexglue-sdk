@@ -17,6 +17,12 @@
 #include <rex/platform.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xsocket.h>
+#include <rex/cvar.h>
+
+REXCVAR_DEFINE_BOOL(net_lan, true, "Network",
+                    "Networking for system link / LAN play. Off = every socket the title binds to all interfaces is "
+                    "bound to the loopback address (127.0.0.1) instead: local sockets still work, nothing listens on "
+                    "the network and Windows asks no firewall question");
 // #include <rex/system/xnet.h>
 
 #include <rex/net/socket.h>
@@ -147,6 +153,9 @@ X_STATUS XSocket::Connect(N_XSOCKADDR* name, int name_len) {
 }
 
 X_STATUS XSocket::Bind(N_XSOCKADDR_IN* name, int name_len) {
+  if (!REXCVAR_GET(net_lan) && name && name->sin_family == AF_INET && name->sin_addr == 0) {
+    name->sin_addr = uint32_t(INADDR_LOOPBACK);  // be<> stores it in network order; net_lan off: no listener
+  }
   int ret = bind(native_handle_, (sockaddr*)name, name_len);
   if (ret < 0) {
     return X_STATUS_UNSUCCESSFUL;
