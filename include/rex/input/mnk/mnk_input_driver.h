@@ -25,6 +25,15 @@ namespace rex::input::mnk {
 void SetMouseLookActive(bool active);
 bool IsMouseLookActive();
 
+/// Menu mode (set by the title while no gameplay look runs): the left mouse
+/// button and Enter also press A, the right button and Escape also press B, the
+/// wheel also presses D-pad up / down; the other binds don't see those keys.
+void SetMenuMode(bool menu);
+bool IsMenuMode();
+/// steady_clock nanoseconds of the last key, button, wheel or mouse motion
+/// (0 = none yet).
+int64_t LastActivityNs();
+
 class MnkInputDriver final : public InputDriver,
                              public rex::ui::WindowInputListener,
                              public rex::ui::WindowListener {
@@ -51,6 +60,7 @@ class MnkInputDriver final : public InputDriver,
   void OnMouseDown(rex::ui::MouseEvent& e) override;
   void OnMouseUp(rex::ui::MouseEvent& e) override;
   void OnMouseMove(rex::ui::MouseEvent& e) override;
+  void OnMouseWheel(rex::ui::MouseEvent& e) override;
 
   // WindowListener
   void OnClosing(rex::ui::UIEvent& e) override;
@@ -70,6 +80,10 @@ class MnkInputDriver final : public InputDriver,
   /// keystroke for each pad button that changed. Call with state_mutex_ held
   /// after any key or mouse button moves.
   void RefreshBoundKeystrokesLocked();
+  /// The pad binds pressed now (bit i = PadBinds()[i]), menu mode applied.
+  uint32_t BoundMaskLocked() const;
+  /// Lets go of the wheel's pseudo keys once their pulse is over.
+  void ReleaseWheelLocked();
 
   // Called from the guest thread. The rest of the capture path stays on the UI
   // thread, since every Window call in it reaches SDL.
@@ -85,6 +99,8 @@ class MnkInputDriver final : public InputDriver,
 
   std::mutex state_mutex_;
   bool key_down_[256] = {};
+  // Wheel pulses: steady_clock ns when the pseudo key is let go (0 = up).
+  int64_t wheel_release_ns_[2] = {};
 
   // Mouse delta tracking. Fractional because relative motion arrives in
   // fractions of a pixel, and truncating each event drops slow movement.

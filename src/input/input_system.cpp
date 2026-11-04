@@ -10,6 +10,8 @@
  */
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <mutex>
@@ -43,6 +45,14 @@ REXCVAR_DEFINE_DOUBLE(right_stick_deadzone_percentage, 0.0, "Input",
                       "Deadzone applied to the right stick, as a fraction of its range")
     .range(0.0, 1.0);
 namespace rex::input {
+
+namespace {
+std::atomic<int64_t> g_last_pad_activity_ns{0};
+}  // namespace
+
+int64_t LastPadActivityNs() {
+  return g_last_pad_activity_ns.load(std::memory_order_relaxed);
+}
 
 namespace {
 
@@ -329,6 +339,13 @@ X_RESULT InputSystem::GetStateForUI(uint32_t user_index, X_INPUT_STATE* out_stat
       continue;
     }
     active_devices_.Observe(user_index, id, state.gamepad);
+    // The keyboard / mouse device (mnk_input_driver.cpp kMnkDevice) keeps its own time.
+    if (static_cast<uint32_t>(id) != 0x4D4E4B00u && !IsNeutral(state.gamepad)) {
+      g_last_pad_activity_ns.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now().time_since_epoch())
+                                       .count(),
+                                   std::memory_order_relaxed);
+    }
     if (!any) {
       merged = state;
       any = true;

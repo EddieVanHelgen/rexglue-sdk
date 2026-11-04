@@ -30,6 +30,10 @@ class Window;
 
 namespace rex::input {
 
+/// steady_clock nanoseconds of the last real input (outside the sticks' and
+/// triggers' rest) from a device other than the keyboard / mouse (0 = none yet).
+int64_t LastPadActivityNs();
+
 class InputSystem : public system::IInputSystem {
  public:
   explicit InputSystem(rex::ui::Window* window);

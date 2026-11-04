@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <chrono>
 #include <cstring>
 #include <string_view>
 
@@ -133,7 +134,9 @@ std::string_view TrimSpaces(std::string_view s) {
 
 bool TokenPressed(const bool (&key_down)[256], std::string_view token, uint8_t live_mods) {
   uint8_t want = TakeModifiers(token);
-  if (want != live_mods) {
+  // A bind with modifiers needs them held; one without ignores them, so a key
+  // bound to Shift / Control (dodge, crouch) doesn't silence movement.
+  if ((live_mods & want) != want) {
     return false;
   }
   rex::ui::VirtualKey vk = rex::ui::ParseVirtualKey(token);
@@ -145,6 +148,34 @@ bool TokenPressed(const bool (&key_down)[256], std::string_view token, uint8_t l
 }
 
 std::atomic<bool> mouse_look_active{true};
+std::atomic<bool> menu_mode{false};
+std::atomic<int64_t> last_activity_ns{0};
+
+// Pseudo keys: the wheel (unassigned VK codes 0x0E / 0x0F) and the side buttons
+// (VK_XBUTTON1 / 2), named WheelUp, WheelDown, Mouse4, Mouse5 in the binds.
+constexpr uint16_t kVkWheelUp = 0x0E;
+constexpr uint16_t kVkWheelDown = 0x0F;
+constexpr uint16_t kVkMouse4 = 0x05;
+constexpr uint16_t kVkMouse5 = 0x06;
+// A wheel notch holds its key this long (at least one poll sees it).
+constexpr int64_t kWheelPulseNs = 80'000'000;
+
+int64_t NowNs() {
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+void NoteActivity() {
+  last_activity_ns.store(NowNs(), std::memory_order_relaxed);
+}
+
+// Menu mode's own keys: kept away from the other binds while it is on.
+constexpr uint16_t kMenuKeys[] = {static_cast<uint16_t>(VirtualKey::kLButton),
+                                  static_cast<uint16_t>(VirtualKey::kRButton),
+                                  static_cast<uint16_t>(VirtualKey::kReturn),
+                                  static_cast<uint16_t>(VirtualKey::kEscape), kVkWheelUp,
+                                  kVkWheelDown};
 
 // ui::VirtualKey follows Windows VK_ numbering; the guest wants USB HID usage
 // page 0x07.
@@ -299,6 +330,18 @@ std::array<PadBind, 24> PadBinds() {
 
 }  // namespace
 
+void SetMenuMode(bool menu) {
+  menu_mode.store(menu, std::memory_order_relaxed);
+}
+
+bool IsMenuMode() {
+  return menu_mode.load(std::memory_order_relaxed);
+}
+
+int64_t LastActivityNs() {
+  return last_activity_ns.load(std::memory_order_relaxed);
+}
+
 void SetMouseLookActive(bool active) {
   mouse_look_active.store(active, std::memory_order_relaxed);
 }
@@ -450,62 +493,46 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
 
   std::lock_guard lock(state_mutex_);
 
+  // PadBinds() order: a b x y lb rb lt rt l3 r3 back start, dpad up down left
+  // right, lstick up down left right, rstick up down left right.
+  const uint32_t mask = BoundMaskLocked();
+  const auto on = [mask](int i) { return (mask >> i) & 1u; };
   uint16_t buttons = 0;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_a)))
-    buttons |= X_INPUT_GAMEPAD_A;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_b)))
-    buttons |= X_INPUT_GAMEPAD_B;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_x)))
-    buttons |= X_INPUT_GAMEPAD_X;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_y)))
-    buttons |= X_INPUT_GAMEPAD_Y;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_left_shoulder)))
-    buttons |= X_INPUT_GAMEPAD_LEFT_SHOULDER;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_right_shoulder)))
-    buttons |= X_INPUT_GAMEPAD_RIGHT_SHOULDER;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_press)))
-    buttons |= X_INPUT_GAMEPAD_LEFT_THUMB;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_press)))
-    buttons |= X_INPUT_GAMEPAD_RIGHT_THUMB;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_back)))
-    buttons |= X_INPUT_GAMEPAD_BACK;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_start)))
-    buttons |= X_INPUT_GAMEPAD_START;
+  if (on(0)) buttons |= X_INPUT_GAMEPAD_A;
+  if (on(1)) buttons |= X_INPUT_GAMEPAD_B;
+  if (on(2)) buttons |= X_INPUT_GAMEPAD_X;
+  if (on(3)) buttons |= X_INPUT_GAMEPAD_Y;
+  if (on(4)) buttons |= X_INPUT_GAMEPAD_LEFT_SHOULDER;
+  if (on(5)) buttons |= X_INPUT_GAMEPAD_RIGHT_SHOULDER;
+  if (on(8)) buttons |= X_INPUT_GAMEPAD_LEFT_THUMB;
+  if (on(9)) buttons |= X_INPUT_GAMEPAD_RIGHT_THUMB;
+  if (on(10)) buttons |= X_INPUT_GAMEPAD_BACK;
+  if (on(11)) buttons |= X_INPUT_GAMEPAD_START;
   if (IsBindPressed(key_down_, REXCVAR_GET(keybind_guide)))
     buttons |= X_INPUT_GAMEPAD_GUIDE;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_up)))
-    buttons |= X_INPUT_GAMEPAD_DPAD_UP;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_down)))
-    buttons |= X_INPUT_GAMEPAD_DPAD_DOWN;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_left)))
-    buttons |= X_INPUT_GAMEPAD_DPAD_LEFT;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_right)))
-    buttons |= X_INPUT_GAMEPAD_DPAD_RIGHT;
+  if (on(12)) buttons |= X_INPUT_GAMEPAD_DPAD_UP;
+  if (on(13)) buttons |= X_INPUT_GAMEPAD_DPAD_DOWN;
+  if (on(14)) buttons |= X_INPUT_GAMEPAD_DPAD_LEFT;
+  if (on(15)) buttons |= X_INPUT_GAMEPAD_DPAD_RIGHT;
 
-  uint8_t lt = IsBindPressed(key_down_, REXCVAR_GET(keybind_left_trigger)) ? 0xFF : 0;
-  uint8_t rt = IsBindPressed(key_down_, REXCVAR_GET(keybind_right_trigger)) ? 0xFF : 0;
+  uint8_t lt = on(6) ? 0xFF : 0;
+  uint8_t rt = on(7) ? 0xFF : 0;
 
   int32_t lx = 0;
   int32_t ly = 0;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_left)))
-    lx -= INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_right)))
-    lx += INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_up)))
-    ly += INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_down)))
-    ly -= INT16_MAX;
+  if (on(18)) lx -= INT16_MAX;
+  if (on(19)) lx += INT16_MAX;
+  if (on(16)) ly += INT16_MAX;
+  if (on(17)) ly -= INT16_MAX;
 
   int32_t rx = 0;
   int32_t ry = 0;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_left)))
-    rx -= INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_right)))
-    rx += INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_up)))
-    ry += INT16_MAX;
-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_down)))
-    ry -= INT16_MAX;
+  if (on(22)) rx -= INT16_MAX;
+  if (on(23)) rx += INT16_MAX;
+  if (on(20)) ry += INT16_MAX;
+  if (on(21)) ry -= INT16_MAX;
+  // The wheel's pulse ends after a poll has seen it.
+  ReleaseWheelLocked();
 
   if (REXCVAR_GET(mnk_mouse) && IsMouseLookActive()) {
     double sensitivity = REXCVAR_GET(mnk_sensitivity);
@@ -551,6 +578,9 @@ X_RESULT MnkInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
   std::lock_guard lock(state_mutex_);
+  if (!IsPassthroughEnabled()) {
+    ReleaseWheelLocked();
+  }
   if (keystroke_queue_.empty()) {
     return X_ERROR_EMPTY;
   }
@@ -604,14 +634,65 @@ void MnkInputDriver::EnqueueRawKeystroke(const rex::ui::KeyEvent& e, bool down) 
   PushKeystroke(ks);
 }
 
-void MnkInputDriver::RefreshBoundKeystrokesLocked() {
+uint32_t MnkInputDriver::BoundMaskLocked() const {
   const auto binds = PadBinds();
+  const bool menu = IsMenuMode();
+  bool masked[256];
+  std::memcpy(masked, key_down_, sizeof(masked));
+  if (menu) {
+    for (uint16_t k : kMenuKeys) {
+      masked[k] = false;
+    }
+  }
   uint32_t pressed = 0;
   for (size_t i = 0; i < binds.size(); i++) {
-    if (IsBindPressed(key_down_, binds[i].keys)) {
+    bool down = IsBindPressed(menu ? masked : key_down_, binds[i].keys);
+    if (menu) {
+      const auto k = [this](uint16_t vk) { return key_down_[vk]; };
+      switch (binds[i].pad_key) {
+        case VirtualKey::kXInputPadA:
+          down = down || k(static_cast<uint16_t>(VirtualKey::kLButton)) ||
+                 k(static_cast<uint16_t>(VirtualKey::kReturn));
+          break;
+        case VirtualKey::kXInputPadB:
+          down = down || k(static_cast<uint16_t>(VirtualKey::kRButton)) ||
+                 k(static_cast<uint16_t>(VirtualKey::kEscape));
+          break;
+        case VirtualKey::kXInputPadDpadUp:
+          down = down || k(kVkWheelUp);
+          break;
+        case VirtualKey::kXInputPadDpadDown:
+          down = down || k(kVkWheelDown);
+          break;
+        default:
+          break;
+      }
+    }
+    if (down) {
       pressed |= uint32_t(1) << i;
     }
   }
+  return pressed;
+}
+
+void MnkInputDriver::ReleaseWheelLocked() {
+  const int64_t now = NowNs();
+  bool changed = false;
+  for (int i = 0; i < 2; ++i) {
+    if (wheel_release_ns_[i] && now >= wheel_release_ns_[i]) {
+      wheel_release_ns_[i] = 0;
+      SetKeyState(i == 0 ? kVkWheelUp : kVkWheelDown, false);
+      changed = true;
+    }
+  }
+  if (changed) {
+    RefreshBoundKeystrokesLocked();
+  }
+}
+
+void MnkInputDriver::RefreshBoundKeystrokesLocked() {
+  const auto binds = PadBinds();
+  const uint32_t pressed = BoundMaskLocked();
 
   // The whole table is diffed rather than the key that moved: binds carry
   // modifiers, so Shift alone can flip several of them at once.
@@ -723,6 +804,7 @@ void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
   SetKeyState(vk, true);
   RefreshBoundKeystrokesLocked();
+  NoteActivity();
 }
 
 void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
@@ -770,10 +852,17 @@ void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
     case rex::ui::MouseEvent::Button::kMiddle:
       SetKeyState(static_cast<uint16_t>(VirtualKey::kMButton), true);
       break;
+    case rex::ui::MouseEvent::Button::kX1:
+      SetKeyState(kVkMouse4, true);
+      break;
+    case rex::ui::MouseEvent::Button::kX2:
+      SetKeyState(kVkMouse5, true);
+      break;
     default:
       break;
   }
   RefreshBoundKeystrokesLocked();
+  NoteActivity();
 }
 
 void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
@@ -790,10 +879,29 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
     case rex::ui::MouseEvent::Button::kMiddle:
       SetKeyState(static_cast<uint16_t>(VirtualKey::kMButton), false);
       break;
+    case rex::ui::MouseEvent::Button::kX1:
+      SetKeyState(kVkMouse4, false);
+      break;
+    case rex::ui::MouseEvent::Button::kX2:
+      SetKeyState(kVkMouse5, false);
+      break;
     default:
       break;
   }
   RefreshBoundKeystrokesLocked();
+}
+
+void MnkInputDriver::OnMouseWheel(rex::ui::MouseEvent& e) {
+  if (!IsEnabled() || !has_focus_ || IsPassthroughEnabled() || e.scroll_y() == 0)
+    return;
+  std::lock_guard lock(state_mutex_);
+  // + = away from the user (up). One pulse per event; notches arriving during a
+  // pulse extend it.
+  const int i = e.scroll_y() > 0 ? 0 : 1;
+  SetKeyState(i == 0 ? kVkWheelUp : kVkWheelDown, true);
+  wheel_release_ns_[i] = NowNs() + kWheelPulseNs;
+  RefreshBoundKeystrokesLocked();
+  NoteActivity();
 }
 
 void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
@@ -801,6 +909,9 @@ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
     return;
   int32_t x = e.x();
   int32_t y = e.y();
+  if (e.dx() != 0.0f || e.dy() != 0.0f || x != prev_mouse_x_ || y != prev_mouse_y_) {
+    NoteActivity();
+  }
   {
     std::lock_guard lock(state_mutex_);
     if (relative_mouse_mode_) {
