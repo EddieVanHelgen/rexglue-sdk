@@ -11,6 +11,7 @@
 #pragma once
 
 #include <rex/input/input_driver.h>
+#include <rex/ui/keybinds.h>
 #include <rex/ui/window.h>
 #include <rex/ui/window_listener.h>
 
@@ -19,6 +20,7 @@
 #include <mutex>
 #include <queue>
 #include <string>
+#include <vector>
 
 namespace rex::input::mnk {
 
@@ -70,6 +72,15 @@ class MnkInputDriver final : public InputDriver,
  private:
   bool IsEnabled() const;
   void SetKeyState(uint16_t vk, bool down);
+  /// Sets one input code (key, mouse button, wheel direction), logging it when
+  /// mnk_log_inputs is on. Call with state_mutex_ held.
+  void SetInputLocked(uint16_t code, bool down, const char* what);
+  /// A key event's VirtualKey and scancode codes. Call with state_mutex_ held.
+  void SetKeyEventLocked(const rex::ui::KeyEvent& e, bool down);
+  /// mnk_test_script: pushes the inputs that are due as SDL events.
+  void RunTestScript();
+  /// Focus as the input handlers see it (always on while a test script runs).
+  bool Focused() const;
   void EnqueueKeystroke(uint16_t vk_pad, bool down);
   /// Appends to the keystroke queue, evicting the oldest entry once it is full.
   void PushKeystroke(const X_INPUT_KEYSTROKE& ks);
@@ -98,9 +109,24 @@ class MnkInputDriver final : public InputDriver,
   rex::ui::Window* attached_window_ = nullptr;
 
   std::mutex state_mutex_;
-  bool key_down_[256] = {};
-  // Wheel pulses: steady_clock ns when the pseudo key is let go (0 = up).
-  int64_t wheel_release_ns_[2] = {};
+  // Every input code (rex::ui::kInputCodeCount): keys by VirtualKey and by
+  // scancode, mouse buttons 1-32, the wheel's four directions.
+  bool key_down_[rex::ui::kInputCodeCount] = {};
+  // Wheel pulses (up, down, left, right): steady_clock ns when the pseudo key
+  // is let go (0 = up).
+  int64_t wheel_release_ns_[4] = {};
+
+  // mnk_test_script.
+  struct TestInput {
+    double at = 0.0;
+    std::string token;
+    double hold = 0.15;
+    int sent = 0;  // 0 none, 1 down, 2 down and up
+  };
+  std::mutex test_mutex_;
+  bool test_parsed_ = false;
+  int64_t test_start_ns_ = 0;
+  std::vector<TestInput> test_inputs_;
 
   // Mouse delta tracking. Fractional because relative motion arrives in
   // fractions of a pixel, and truncating each event drops slow movement.

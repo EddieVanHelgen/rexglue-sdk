@@ -15,7 +15,11 @@
 #include <rex/logging.h>
 #include <rex/ui/keybinds.h>
 #include <rex/ui/virtual_key.h>
+#include <rex/ui/sdl_virtual_key.h>
 #include <rex/ui/window.h>
+
+#include <SDL3/SDL_events.h>
+#include <SDL3/SDL_video.h>
 
 #include <algorithm>
 #include <cmath>
@@ -59,6 +63,14 @@ REXCVAR_DEFINE_STRING(keybind_back, "Z,Tab", "Input/Keybinds/Controller", "Back 
 REXCVAR_DEFINE_STRING(keybind_start, "X,Return", "Input/Keybinds/Controller", "Start button");
 REXCVAR_DEFINE_STRING(keybind_guide, "", "Input/Keybinds/Controller", "Guide button");
 
+REXCVAR_DEFINE_STRING(mnk_test_script, "", "Testing",
+                      "TESTING TOOL: inputs pushed as real SDL events, ';'-separated '<seconds> <bind token> "
+                      "[hold seconds]' (time from the first pad poll; e.g. '20 Mouse4; 22 WheelLeft; 24 RControl "
+                      "0.3'). Each input and every pad button it changes is logged ('mnk: ...')");
+REXCVAR_DEFINE_BOOL(mnk_log_inputs, false, "Input",
+                    "Log every key / mouse button / wheel input the keyboard and mouse driver sees, with its bind "
+                    "token, and every pad button the binds change (on by itself with mnk_test_script)");
+
 REXCVAR_DEFINE_BOOL(mnk_passthrough, false, "Input",
                     "Surface raw keystrokes to the title instead of emulating a pad, for "
                     "titles that read a USB keyboard. Enables the device on its own");
@@ -85,7 +97,9 @@ constexpr uint8_t kModShift = 1u << 0;
 constexpr uint8_t kModCtrl = 1u << 1;
 constexpr uint8_t kModAlt = 1u << 2;
 
-uint8_t LiveModifiers(const bool (&key_down)[256]) {
+using KeyState = bool[rex::ui::kInputCodeCount];
+
+uint8_t LiveModifiers(const KeyState& key_down) {
   uint8_t mods = 0;
   if (key_down[static_cast<uint16_t>(rex::ui::VirtualKey::kShift)])
     mods |= kModShift;
@@ -132,31 +146,41 @@ std::string_view TrimSpaces(std::string_view s) {
   return s;
 }
 
-bool TokenPressed(const bool (&key_down)[256], std::string_view token, uint8_t live_mods) {
+bool TokenPressed(const KeyState& key_down, std::string_view token, uint8_t live_mods) {
   uint8_t want = TakeModifiers(token);
   // A bind with modifiers needs them held; one without ignores them, so a key
   // bound to Shift / Control (dodge, crouch) doesn't silence movement.
   if ((live_mods & want) != want) {
     return false;
   }
-  rex::ui::VirtualKey vk = rex::ui::ParseVirtualKey(token);
-  if (vk == rex::ui::VirtualKey::kNone) {
-    return false;
-  }
-  uint16_t idx = static_cast<uint16_t>(vk);
-  return idx < 256 && key_down[idx];
+  // Any key (by VirtualKey or scancode), mouse button 1-32 or wheel direction.
+  const uint16_t idx = rex::ui::ParseInputCode(token);
+  return idx != 0 && idx < rex::ui::kInputCodeCount && key_down[idx];
 }
 
 std::atomic<bool> mouse_look_active{true};
 std::atomic<bool> menu_mode{false};
 std::atomic<int64_t> last_activity_ns{0};
 
-// Pseudo keys: the wheel (unassigned VK codes 0x0E / 0x0F) and the side buttons
-// (VK_XBUTTON1 / 2), named WheelUp, WheelDown, Mouse4, Mouse5 in the binds.
-constexpr uint16_t kVkWheelUp = 0x0E;
-constexpr uint16_t kVkWheelDown = 0x0F;
-constexpr uint16_t kVkMouse4 = 0x05;
-constexpr uint16_t kVkMouse5 = 0x06;
+// Pseudo keys (rex::ui input codes): the wheel's four directions (WheelUp,
+// WheelDown, WheelLeft, WheelRight) and mouse buttons 4-32 (Mouse4 ..).
+constexpr uint16_t kVkWheelUp = rex::ui::kInputCodeWheelUp;
+constexpr uint16_t kVkWheelDown = rex::ui::kInputCodeWheelDown;
+constexpr uint16_t kWheelCodes[4] = {rex::ui::kInputCodeWheelUp, rex::ui::kInputCodeWheelDown,
+                                     rex::ui::kInputCodeWheelLeft, rex::ui::kInputCodeWheelRight};
+
+bool LogInputs() {
+  return REXCVAR_GET(mnk_log_inputs) || !REXCVAR_GET(mnk_test_script).empty();
+}
+
+const char* PadBindName(size_t i) {
+  static const char* const kNames[] = {
+      "A", "B", "X", "Y", "LB", "RB", "LT", "RT", "L3", "R3", "Back", "Start",
+      "D-pad up", "D-pad down", "D-pad left", "D-pad right", "left stick up", "left stick down",
+      "left stick left", "left stick right", "right stick up", "right stick down", "right stick left",
+      "right stick right"};
+  return i < sizeof(kNames) / sizeof(kNames[0]) ? kNames[i] : "?";
+}
 // A wheel notch holds its key this long (at least one poll sees it).
 constexpr int64_t kWheelPulseNs = 80'000'000;
 
@@ -406,7 +430,7 @@ static bool IsPassthroughEnabled() {
   return REXCVAR_GET(mnk_passthrough);
 }
 
-static bool IsBindPressed(const bool (&key_down)[256], const std::string& cvar_val) {
+static bool IsBindPressed(const KeyState& key_down, const std::string& cvar_val) {
   const uint8_t live_mods = LiveModifiers(key_down);
   std::string_view rest(cvar_val);
   while (!rest.empty()) {
@@ -478,12 +502,16 @@ X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
+  if (!REXCVAR_GET(mnk_test_script).empty()) {
+    RunTestScript();
+  }
+
   // Mouse look is opt in. Without this gate, keyboard input alone would hide
   // and lock the cursor, breaking the ImGui overlays.
   QueueMouseCaptureUpdate(IsEnabled() && REXCVAR_GET(mnk_mouse) && IsMouseLookActive() &&
                           has_focus_ && is_active());
 
-  if (!is_active() || !has_focus_) {
+  if (!is_active() || !Focused()) {
     if (out_state) {
       std::memset(out_state, 0, sizeof(*out_state));
       out_state->packet_number = packet_number_;
@@ -637,7 +665,7 @@ void MnkInputDriver::EnqueueRawKeystroke(const rex::ui::KeyEvent& e, bool down) 
 uint32_t MnkInputDriver::BoundMaskLocked() const {
   const auto binds = PadBinds();
   const bool menu = IsMenuMode();
-  bool masked[256];
+  static thread_local KeyState masked;
   std::memcpy(masked, key_down_, sizeof(masked));
   if (menu) {
     for (uint16_t k : kMenuKeys) {
@@ -678,10 +706,10 @@ uint32_t MnkInputDriver::BoundMaskLocked() const {
 void MnkInputDriver::ReleaseWheelLocked() {
   const int64_t now = NowNs();
   bool changed = false;
-  for (int i = 0; i < 2; ++i) {
+  for (int i = 0; i < 4; ++i) {
     if (wheel_release_ns_[i] && now >= wheel_release_ns_[i]) {
       wheel_release_ns_[i] = 0;
-      SetKeyState(i == 0 ? kVkWheelUp : kVkWheelDown, false);
+      SetInputLocked(kWheelCodes[i], false, "");
       changed = true;
     }
   }
@@ -701,10 +729,15 @@ void MnkInputDriver::RefreshBoundKeystrokesLocked() {
   if (!changed) {
     return;
   }
+  const bool log = LogInputs();
   for (size_t i = 0; i < binds.size(); i++) {
     const uint32_t bit = uint32_t(1) << i;
     if (changed & bit) {
       EnqueueKeystroke(static_cast<uint16_t>(binds[i].pad_key), (pressed & bit) != 0);
+      if (log) {
+        REXLOG_INFO("mnk: pad {} {} (bind \"{}\"{})", PadBindName(i), (pressed & bit) ? "pressed" : "released",
+                    binds[i].keys, IsMenuMode() ? ", menu mode" : "");
+      }
     }
   }
 }
@@ -759,6 +792,20 @@ void MnkInputDriver::ReleaseMouseCaptureFromUIThread(rex::ui::Window* window) {
     return;
   }
   mouse_captured_ = false;
+  {
+    // Buttons 6+ come from Raw Input, which stops with the pointer lock: let
+    // go of any still held, or its release would never arrive.
+    std::lock_guard lock(state_mutex_);
+    bool any = false;
+    for (int b = 6; b <= 32; ++b) {
+      const uint16_t code = rex::ui::InputCodeForMouseButton(b);
+      any = any || key_down_[code];
+      key_down_[code] = false;
+    }
+    if (any) {
+      RefreshBoundKeystrokesLocked();
+    }
+  }
   window->SetCursorVisibility(precapture_cursor_visibility_);
   window->SetRelativeMouseMode(false);
   relative_mouse_mode_ = false;
@@ -788,21 +835,55 @@ void MnkInputDriver::RecenterCursorFromUIThread(int32_t x, int32_t y) {
 }
 
 void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
-  if (vk < 256) {
+  if (vk < rex::ui::kInputCodeCount) {
     key_down_[vk] = down;
   }
 }
 
+void MnkInputDriver::SetInputLocked(uint16_t code, bool down, const char* what) {
+  if (code == 0 || code >= rex::ui::kInputCodeCount) {
+    return;
+  }
+  if (LogInputs() && key_down_[code] != down) {
+    REXLOG_INFO("mnk: input {} [{}] {}{}", rex::ui::InputCodeDisplayName(code), rex::ui::InputCodeToken(code),
+                down ? "down" : "up", what);
+  }
+  key_down_[code] = down;
+}
+
+void MnkInputDriver::SetKeyEventLocked(const rex::ui::KeyEvent& e, bool down) {
+  // Both names a key has: its VirtualKey (shared by left / right Shift, Ctrl,
+  // Alt) and its scancode's own code (each physical key; keys with no
+  // VirtualKey have only this). The input is logged once, under the name a
+  // bind is written with.
+  const int sc = e.scancode();
+  const bool has_sc = sc > 0 && sc < int(rex::ui::kInputCodeCount - rex::ui::kInputCodeScancodeBase);
+  const uint16_t sc_code = has_sc ? uint16_t(rex::ui::kInputCodeScancodeBase + sc) : 0;
+  const bool sc_is_name = has_sc && rex::ui::InputCodeForScancode(sc) == sc_code;
+  const uint16_t vk = static_cast<uint16_t>(e.virtual_key());
+  if (vk != 0 && vk < 256) {
+    if (sc_is_name) {
+      key_down_[vk] = down;
+    } else {
+      SetInputLocked(vk, down, "");
+    }
+  }
+  if (sc_is_name) {
+    SetInputLocked(sc_code, down, "");
+  } else if (has_sc) {
+    key_down_[sc_code] = down;
+  }
+}
+
 void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
-  if (!IsEnabled() || !has_focus_)
+  if (!IsEnabled() || !Focused())
     return;
   std::lock_guard lock(state_mutex_);
   if (IsPassthroughEnabled()) {
     EnqueueRawKeystroke(e, true);
     return;
   }
-  uint16_t vk = static_cast<uint16_t>(e.virtual_key());
-  SetKeyState(vk, true);
+  SetKeyEventLocked(e, true);
   RefreshBoundKeystrokesLocked();
   NoteActivity();
 }
@@ -815,8 +896,7 @@ void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
     EnqueueRawKeystroke(e, false);
     return;
   }
-  uint16_t vk = static_cast<uint16_t>(e.virtual_key());
-  SetKeyState(vk, false);
+  SetKeyEventLocked(e, false);
   RefreshBoundKeystrokesLocked();
 }
 
@@ -839,28 +919,11 @@ void MnkInputDriver::OnKeyChar(rex::ui::KeyEvent& e) {
 }
 
 void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
-  if (!IsEnabled() || !has_focus_)
+  if (!IsEnabled() || !Focused())
     return;
   std::lock_guard lock(state_mutex_);
-  switch (e.button()) {
-    case rex::ui::MouseEvent::Button::kLeft:
-      SetKeyState(static_cast<uint16_t>(VirtualKey::kLButton), true);
-      break;
-    case rex::ui::MouseEvent::Button::kRight:
-      SetKeyState(static_cast<uint16_t>(VirtualKey::kRButton), true);
-      break;
-    case rex::ui::MouseEvent::Button::kMiddle:
-      SetKeyState(static_cast<uint16_t>(VirtualKey::kMButton), true);
-      break;
-    case rex::ui::MouseEvent::Button::kX1:
-      SetKeyState(kVkMouse4, true);
-      break;
-    case rex::ui::MouseEvent::Button::kX2:
-      SetKeyState(kVkMouse5, true);
-      break;
-    default:
-      break;
-  }
+  // Buttons 1-5 and, through Raw Input, 6-32 (the enum keeps the button number).
+  SetInputLocked(rex::ui::InputCodeForMouseButton(static_cast<int>(e.button())), true, "");
   RefreshBoundKeystrokesLocked();
   NoteActivity();
 }
@@ -869,43 +932,33 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
   if (!IsEnabled())
     return;
   std::lock_guard lock(state_mutex_);
-  switch (e.button()) {
-    case rex::ui::MouseEvent::Button::kLeft:
-      SetKeyState(static_cast<uint16_t>(VirtualKey::kLButton), false);
-      break;
-    case rex::ui::MouseEvent::Button::kRight:
-      SetKeyState(static_cast<uint16_t>(VirtualKey::kRButton), false);
-      break;
-    case rex::ui::MouseEvent::Button::kMiddle:
-      SetKeyState(static_cast<uint16_t>(VirtualKey::kMButton), false);
-      break;
-    case rex::ui::MouseEvent::Button::kX1:
-      SetKeyState(kVkMouse4, false);
-      break;
-    case rex::ui::MouseEvent::Button::kX2:
-      SetKeyState(kVkMouse5, false);
-      break;
-    default:
-      break;
-  }
+  SetInputLocked(rex::ui::InputCodeForMouseButton(static_cast<int>(e.button())), false, "");
   RefreshBoundKeystrokesLocked();
 }
 
 void MnkInputDriver::OnMouseWheel(rex::ui::MouseEvent& e) {
-  if (!IsEnabled() || !has_focus_ || IsPassthroughEnabled() || e.scroll_y() == 0)
+  if (!IsEnabled() || !Focused() || IsPassthroughEnabled() || (e.scroll_y() == 0 && e.scroll_x() == 0))
     return;
   std::lock_guard lock(state_mutex_);
-  // + = away from the user (up). One pulse per event; notches arriving during a
-  // pulse extend it.
-  const int i = e.scroll_y() > 0 ? 0 : 1;
-  SetKeyState(i == 0 ? kVkWheelUp : kVkWheelDown, true);
-  wheel_release_ns_[i] = NowNs() + kWheelPulseNs;
+  // y + = away from the user (up); x + = tilted right. One pulse per event;
+  // notches arriving during a pulse extend it.
+  const int64_t release = NowNs() + kWheelPulseNs;
+  auto pulse = [&](int i) {
+    SetInputLocked(kWheelCodes[i], true, "");
+    wheel_release_ns_[i] = release;
+  };
+  if (e.scroll_y() != 0) {
+    pulse(e.scroll_y() > 0 ? 0 : 1);
+  }
+  if (e.scroll_x() != 0) {
+    pulse(e.scroll_x() > 0 ? 3 : 2);
+  }
   RefreshBoundKeystrokesLocked();
   NoteActivity();
 }
 
 void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
-  if (!IsEnabled() || !has_focus_)
+  if (!IsEnabled() || !Focused())
     return;
   int32_t x = e.x();
   int32_t y = e.y();
@@ -951,6 +1004,123 @@ void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
 
 void MnkInputDriver::OnGotFocus(rex::ui::UISetupEvent&) {
   has_focus_ = true;
+}
+
+bool MnkInputDriver::Focused() const {
+  return has_focus_ || !REXCVAR_GET(mnk_test_script).empty();
+}
+
+namespace {
+
+// One input as the SDL event the platform would send for it.
+bool PushTestSdlInput(const std::string& token, bool down) {
+  const uint16_t code = rex::ui::ParseInputCode(token);
+  if (code == 0) {
+    return false;
+  }
+  SDL_WindowID window_id = 0;
+  int count = 0;
+  if (SDL_Window** windows = SDL_GetWindows(&count)) {
+    if (count > 0) {
+      window_id = SDL_GetWindowID(windows[0]);
+    }
+    SDL_free(windows);
+  }
+  SDL_Event ev{};
+  int button = 0;
+  for (int b = 1; b <= 32 && !button; ++b) {
+    if (rex::ui::InputCodeForMouseButton(b) == code) {
+      button = b;
+    }
+  }
+  if (button) {
+    ev.type = down ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
+    ev.button.windowID = window_id;
+    ev.button.button = Uint8(button);
+    ev.button.down = down;
+    ev.button.clicks = 1;
+  } else if (code == rex::ui::kInputCodeWheelUp || code == rex::ui::kInputCodeWheelDown ||
+             code == rex::ui::kInputCodeWheelLeft || code == rex::ui::kInputCodeWheelRight) {
+    if (!down) {
+      return true;  // a wheel notch has no release
+    }
+    ev.type = SDL_EVENT_MOUSE_WHEEL;
+    ev.wheel.windowID = window_id;
+    ev.wheel.direction = SDL_MOUSEWHEEL_NORMAL;
+    ev.wheel.x = code == rex::ui::kInputCodeWheelLeft    ? -1.0f
+                 : code == rex::ui::kInputCodeWheelRight ? 1.0f
+                                                         : 0.0f;
+    ev.wheel.y = code == rex::ui::kInputCodeWheelUp     ? 1.0f
+                 : code == rex::ui::kInputCodeWheelDown ? -1.0f
+                                                        : 0.0f;
+  } else {
+    int scancode = 0;
+    if (code >= rex::ui::kInputCodeScancodeBase) {
+      scancode = code - rex::ui::kInputCodeScancodeBase;
+    } else {
+      for (int sc = 1; sc < SDL_SCANCODE_COUNT && !scancode; ++sc) {
+        if (static_cast<uint16_t>(rex::ui::TranslateSDLScancode(static_cast<SDL_Scancode>(sc))) == code) {
+          scancode = sc;
+        }
+      }
+    }
+    if (!scancode) {
+      return false;
+    }
+    ev.type = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+    ev.key.windowID = window_id;
+    ev.key.scancode = static_cast<SDL_Scancode>(scancode);
+    ev.key.down = down;
+    ev.key.repeat = false;
+  }
+  return SDL_PushEvent(&ev);
+}
+
+}  // namespace
+
+void MnkInputDriver::RunTestScript() {
+  std::lock_guard lock(test_mutex_);
+  const int64_t now = NowNs();
+  if (!test_parsed_) {
+    test_parsed_ = true;
+    test_start_ns_ = now;
+    std::string_view rest(REXCVAR_GET(mnk_test_script));
+    while (!rest.empty()) {
+      const size_t semi = rest.find(';');
+      std::string_view item = TrimSpaces(rest.substr(0, semi));
+      rest = semi == std::string_view::npos ? std::string_view() : rest.substr(semi + 1);
+      TestInput in;
+      size_t sp = item.find(' ');
+      const std::string at(item.substr(0, sp));
+      item = sp == std::string_view::npos ? std::string_view() : TrimSpaces(item.substr(sp + 1));
+      sp = item.find(' ');
+      in.token = std::string(item.substr(0, sp));
+      const std::string hold =
+          sp == std::string_view::npos ? std::string() : std::string(TrimSpaces(item.substr(sp + 1)));
+      in.at = std::atof(at.c_str());
+      if (!hold.empty()) {
+        in.hold = std::atof(hold.c_str());
+      }
+      if (!in.token.empty()) {
+        test_inputs_.push_back(in);
+      }
+    }
+    REXLOG_INFO("mnk: test script: {} inputs", test_inputs_.size());
+  }
+  const double t = double(now - test_start_ns_) / 1e9;
+  for (TestInput& in : test_inputs_) {
+    if (in.sent == 0 && t >= in.at) {
+      in.sent = 1;
+      const bool ok = PushTestSdlInput(in.token, true);
+      REXLOG_INFO("mnk: test t={:.2f} s: {} [{}] pressed{}", t,
+                  rex::ui::InputCodeDisplayName(rex::ui::ParseInputCode(in.token)), in.token,
+                  ok ? "" : " (NOT pushed: unknown token or SDL refused)");
+    }
+    if (in.sent == 1 && t >= in.at + in.hold) {
+      in.sent = 2;
+      PushTestSdlInput(in.token, false);
+    }
+  }
 }
 
 }  // namespace rex::input::mnk

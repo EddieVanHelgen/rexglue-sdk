@@ -18,6 +18,7 @@ set(REXUI_CORE_SOURCES
     presenter.cpp
     renderdoc_api.cpp
     sdl_virtual_key.cpp
+    win32_scancode.cpp
     window.cpp
     window_sdl.cpp
     windowed_app.cpp

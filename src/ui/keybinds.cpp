@@ -10,6 +10,12 @@
  */
 #include <rex/ui/keybinds.h>
 #include <rex/cvar.h>
+#include <rex/ui/sdl_virtual_key.h>
+
+#include <SDL3/SDL_keyboard.h>
+#include <SDL3/SDL_scancode.h>
+
+#include <charconv>
 #include <mutex>
 #include <string>
 #include <deque>
@@ -19,7 +25,8 @@ namespace rex::ui {
 
 using rex::ui::VirtualKey;
 
-static const std::unordered_map<std::string, VirtualKey> kKeyNames = {
+// In priority order: where two names share a key, the first is the one written back.
+static const std::pair<const char*, VirtualKey> kKeyTable[] = {
     // Function keys
     {"F1", VirtualKey::kF1},
     {"F2", VirtualKey::kF2},
@@ -137,6 +144,7 @@ static const std::unordered_map<std::string, VirtualKey> kKeyNames = {
     {"CapsLock", VirtualKey::kCapital},
     {"NumLock", VirtualKey::kNumLock},
     {"ScrollLock", VirtualKey::kScroll},
+    {"NumpadPeriod", VirtualKey::kDecimal},
     // Mouse buttons
     {"Mouse4", static_cast<VirtualKey>(0x05)},
     {"Mouse5", static_cast<VirtualKey>(0x06)},
@@ -147,18 +155,36 @@ static const std::unordered_map<std::string, VirtualKey> kKeyNames = {
     {"MMB", VirtualKey::kMButton},
 };
 
+static const std::unordered_map<std::string_view, VirtualKey>& KeyNames() {
+  static const auto* names = [] {
+    auto* m = new std::unordered_map<std::string_view, VirtualKey>();
+    for (const auto& [name, key] : kKeyTable) {
+      m->emplace(name, key);
+    }
+    return m;
+  }();
+  return *names;
+}
+
+static const std::unordered_map<uint16_t, std::string_view>& KeyTokens() {
+  static const auto* tokens = [] {
+    auto* m = new std::unordered_map<uint16_t, std::string_view>();
+    for (const auto& [name, key] : kKeyTable) {
+      m->emplace(static_cast<uint16_t>(key), name);  // the first name wins
+    }
+    return m;
+  }();
+  return *tokens;
+}
+
 VirtualKey ParseVirtualKey(std::string_view name) {
-  auto it = kKeyNames.find(std::string(name));
-  return (it != kKeyNames.end()) ? it->second : VirtualKey::kNone;
+  auto it = KeyNames().find(name);
+  return (it != KeyNames().end()) ? it->second : VirtualKey::kNone;
 }
 
 std::string VirtualKeyToString(VirtualKey vk) {
-  for (const auto& [name, key] : kKeyNames) {
-    if (key == vk) {
-      return name;
-    }
-  }
-  return {};
+  auto it = KeyTokens().find(static_cast<uint16_t>(vk));
+  return it != KeyTokens().end() ? std::string(it->second) : std::string();
 }
 
 /* ---- Bind registry ---- */
@@ -225,6 +251,204 @@ bool ProcessKeyEvent(KeyEvent& e) {
     }
   }
   return false;
+}
+
+/* ---- Input codes (see keybinds.h) ---- */
+
+namespace {
+
+// Keys a VirtualKey can't tell apart, bound by their scancode under these names.
+struct ScancodeName {
+  SDL_Scancode scancode;
+  const char* token;
+  const char* display;
+};
+constexpr ScancodeName kScancodeNames[] = {
+    {SDL_SCANCODE_LSHIFT, "LShift", "Left Shift"},
+    {SDL_SCANCODE_RSHIFT, "RShift", "Right Shift"},
+    {SDL_SCANCODE_LCTRL, "LControl", "Left Ctrl"},
+    {SDL_SCANCODE_RCTRL, "RControl", "Right Ctrl"},
+    {SDL_SCANCODE_LALT, "LAlt", "Left Alt"},
+    {SDL_SCANCODE_RALT, "RAlt", "Right Alt (AltGr)"},
+    {SDL_SCANCODE_KP_ENTER, "NumpadEnter", "Numpad Enter"},
+    {SDL_SCANCODE_LGUI, "LWin", "Left Windows"},
+    {SDL_SCANCODE_RGUI, "RWin", "Right Windows"},
+    {SDL_SCANCODE_APPLICATION, "Apps", "Menu key"},
+    {SDL_SCANCODE_NONUSBACKSLASH, "Oem102", "\\ (next to Left Shift)"},
+};
+
+// Readable names for VirtualKey tokens whose token isn't readable already.
+constexpr std::pair<VirtualKey, const char*> kVkDisplay[] = {
+    {VirtualKey::kShift, "Shift"},
+    {VirtualKey::kControl, "Ctrl"},
+    {VirtualKey::kMenu, "Alt"},
+    {VirtualKey::kReturn, "Enter"},
+    {VirtualKey::kEscape, "Esc"},
+    {VirtualKey::kBack, "Backspace"},
+    {VirtualKey::kPrior, "Page Up"},
+    {VirtualKey::kNext, "Page Down"},
+    {VirtualKey::kLeft, "Left arrow"},
+    {VirtualKey::kRight, "Right arrow"},
+    {VirtualKey::kUp, "Up arrow"},
+    {VirtualKey::kDown, "Down arrow"},
+    {VirtualKey::kOem3, "` (backtick)"},
+    {VirtualKey::kOemMinus, "-"},
+    {VirtualKey::kOemPlus, "="},
+    {VirtualKey::kOemComma, ","},
+    {VirtualKey::kOemPeriod, "."},
+    {VirtualKey::kOem1, ";"},
+    {VirtualKey::kOem2, "/"},
+    {VirtualKey::kOem5, "\\"},
+    {VirtualKey::kOem4, "["},
+    {VirtualKey::kOem6, "]"},
+    {VirtualKey::kOem7, "' (quote)"},
+    {VirtualKey::kAdd, "Numpad +"},
+    {VirtualKey::kSubtract, "Numpad -"},
+    {VirtualKey::kMultiply, "Numpad *"},
+    {VirtualKey::kDivide, "Numpad /"},
+    {VirtualKey::kDecimal, "Numpad ."},
+    {VirtualKey::kSnapshot, "Print Screen"},
+    {VirtualKey::kCapital, "Caps Lock"},
+    {VirtualKey::kNumLock, "Num Lock"},
+    {VirtualKey::kScroll, "Scroll Lock"},
+    {VirtualKey::kLButton, "Left mouse button"},
+    {VirtualKey::kRButton, "Right mouse button"},
+    {VirtualKey::kMButton, "Middle mouse button"},
+    {static_cast<VirtualKey>(0x05), "Mouse 4 (back)"},
+    {static_cast<VirtualKey>(0x06), "Mouse 5 (forward)"},
+    {static_cast<VirtualKey>(kInputCodeWheelUp), "Wheel up"},
+    {static_cast<VirtualKey>(kInputCodeWheelDown), "Wheel down"},
+};
+
+bool ParseNumber(std::string_view s, int& out) {
+  if (s.empty()) {
+    return false;
+  }
+  auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), out);
+  return ec == std::errc() && ptr == s.data() + s.size();
+}
+
+}  // namespace
+
+uint16_t InputCodeForMouseButton(int button) {
+  switch (button) {
+    case 1:
+      return static_cast<uint16_t>(VirtualKey::kLButton);
+    case 2:
+      return static_cast<uint16_t>(VirtualKey::kRButton);
+    case 3:
+      return static_cast<uint16_t>(VirtualKey::kMButton);
+    case 4:
+      return 0x05;
+    case 5:
+      return 0x06;
+    default:
+      return (button >= 6 && button <= 32) ? uint16_t(kInputCodeMouseBase + button) : 0;
+  }
+}
+
+uint16_t InputCodeForScancode(int sdl_scancode) {
+  if (sdl_scancode <= 0 || sdl_scancode >= int(kInputCodeCount - kInputCodeScancodeBase)) {
+    return 0;
+  }
+  for (const auto& n : kScancodeNames) {
+    if (n.scancode == sdl_scancode) {
+      return uint16_t(kInputCodeScancodeBase + sdl_scancode);
+    }
+  }
+  const VirtualKey vk = TranslateSDLScancode(static_cast<SDL_Scancode>(sdl_scancode));
+  if (vk != VirtualKey::kNone && !VirtualKeyToString(vk).empty()) {
+    return static_cast<uint16_t>(vk);
+  }
+  return uint16_t(kInputCodeScancodeBase + sdl_scancode);
+}
+
+uint16_t ParseInputCode(std::string_view token) {
+  if (token.empty()) {
+    return 0;
+  }
+  for (const auto& n : kScancodeNames) {
+    if (token == n.token) {
+      return uint16_t(kInputCodeScancodeBase + n.scancode);
+    }
+  }
+  if (token == "WheelLeft") {
+    return kInputCodeWheelLeft;
+  }
+  if (token == "WheelRight") {
+    return kInputCodeWheelRight;
+  }
+  int n = 0;
+  if (token.size() > 5 && token.substr(0, 5) == "Mouse" && ParseNumber(token.substr(5), n)) {
+    return InputCodeForMouseButton(n);
+  }
+  if (token.size() > 8 && token.substr(0, 8) == "Scancode" && ParseNumber(token.substr(8), n)) {
+    return (n > 0 && n < int(kInputCodeCount - kInputCodeScancodeBase)) ? uint16_t(kInputCodeScancodeBase + n)
+                                                                        : uint16_t(0);
+  }
+  const VirtualKey vk = ParseVirtualKey(token);
+  return vk == VirtualKey::kNone ? uint16_t(0) : static_cast<uint16_t>(vk);
+}
+
+std::string InputCodeToken(uint16_t code) {
+  if (code == 0 || code >= kInputCodeCount) {
+    return {};
+  }
+  if (code >= kInputCodeScancodeBase) {
+    const int sc = code - kInputCodeScancodeBase;
+    for (const auto& n : kScancodeNames) {
+      if (n.scancode == sc) {
+        return n.token;
+      }
+    }
+    return "Scancode" + std::to_string(sc);
+  }
+  if (code == kInputCodeWheelLeft) {
+    return "WheelLeft";
+  }
+  if (code == kInputCodeWheelRight) {
+    return "WheelRight";
+  }
+  if (code > kInputCodeMouseBase && code <= kInputCodeMouseBase + 32) {
+    return "Mouse" + std::to_string(code - kInputCodeMouseBase);
+  }
+  return VirtualKeyToString(static_cast<VirtualKey>(code));
+}
+
+std::string InputCodeDisplayName(uint16_t code) {
+  if (code == 0 || code >= kInputCodeCount) {
+    return {};
+  }
+  if (code >= kInputCodeScancodeBase) {
+    const int sc = code - kInputCodeScancodeBase;
+    for (const auto& n : kScancodeNames) {
+      if (n.scancode == sc) {
+        return n.display;
+      }
+    }
+    const char* name = SDL_GetScancodeName(static_cast<SDL_Scancode>(sc));
+    return (name && *name) ? std::string(name) : "Key " + std::to_string(sc);
+  }
+  if (code == kInputCodeWheelLeft) {
+    return "Wheel left (tilt)";
+  }
+  if (code == kInputCodeWheelRight) {
+    return "Wheel right (tilt)";
+  }
+  if (code > kInputCodeMouseBase && code <= kInputCodeMouseBase + 32) {
+    return "Mouse " + std::to_string(code - kInputCodeMouseBase);
+  }
+  for (const auto& [vk, name] : kVkDisplay) {
+    if (static_cast<uint16_t>(vk) == code) {
+      return name;
+    }
+  }
+  const VirtualKey vk = static_cast<VirtualKey>(code);
+  if (vk >= VirtualKey::kNumpad0 && vk <= VirtualKey::kNumpad9) {
+    return "Numpad " + std::to_string(code - static_cast<uint16_t>(VirtualKey::kNumpad0));
+  }
+  std::string token = VirtualKeyToString(vk);
+  return token.empty() ? "Key " + std::to_string(code) : token;
 }
 
 }  // namespace rex::ui

@@ -97,9 +97,16 @@ class KeyEvent : public UIEvent {
   bool is_alt_pressed() const { return modifier_alt_pressed_; }
   bool is_super_pressed() const { return modifier_super_pressed_; }
 
+  // The SDL scancode of the physical key (0 = unknown). Tells apart keys that
+  // share a VirtualKey (left / right Shift, Numpad Enter) and names keys that
+  // have none (virtual_key() is kNone then).
+  int scancode() const { return scancode_; }
+  void set_scancode(int scancode) { scancode_ = scancode; }
+
  private:
   bool handled_ = false;
   VirtualKey virtual_key_ = VirtualKey::kNone;
+  int scancode_ = 0;
 
   int repeat_count_ = 0;
   bool prev_state_ = false;  // Key previously down(true) or up(false)
@@ -119,6 +126,7 @@ class MouseEvent : public UIEvent {
     kMiddle,
     kX1,
     kX2,
+    // Buttons 6-32 are Button(6)..Button(32) (Raw Input's further buttons).
   };
 
  public:

@@ -82,4 +82,41 @@ void UnregisterBind(std::string_view name);
  */
 bool ProcessKeyEvent(KeyEvent& e);
 
+/* ---- Input codes: every bindable key, mouse button and wheel direction ----
+ *
+ * One number per physical input, used by the keyboard / mouse pad binds
+ * (keybind_*) and by tools that write them (a settings window). Bind tokens
+ * name a code; InputCodeToken / ParseInputCode round-trip exactly.
+ *
+ *   0x001-0x0FF  a Windows-style VirtualKey (keys and the classic mouse buttons:
+ *                LMB 0x01, RMB 0x02, MMB 0x04, Mouse4 0x05, Mouse5 0x06) plus
+ *                the wheel's pseudo keys WheelUp 0x0E / WheelDown 0x0F;
+ *   0x106-0x120  mouse buttons 6-32 ("Mouse6".."Mouse32"), from Raw Input;
+ *   0x121/0x122  wheel tilt left / right ("WheelLeft", "WheelRight");
+ *   0x200-0x3FF  0x200 + SDL scancode, for keys a VirtualKey can't tell apart
+ *                (left / right Shift, Ctrl, Alt; Numpad Enter) or doesn't
+ *                have at all ("Scancode<N>"). */
+constexpr uint16_t kInputCodeCount = 0x400;
+constexpr uint16_t kInputCodeMouseBase = 0x100;  // + button number (6..32)
+constexpr uint16_t kInputCodeWheelUp = 0x0E;
+constexpr uint16_t kInputCodeWheelDown = 0x0F;
+constexpr uint16_t kInputCodeWheelLeft = 0x121;
+constexpr uint16_t kInputCodeWheelRight = 0x122;
+constexpr uint16_t kInputCodeScancodeBase = 0x200;
+
+/// The code a bind token names (modifier prefixes already removed), or 0.
+uint16_t ParseInputCode(std::string_view token);
+/// The token a bind is written with ("R", "LControl", "Mouse4", "WheelLeft").
+std::string InputCodeToken(uint16_t code);
+/// A readable name ("Left Ctrl", "Mouse 4 (back)", "Wheel up").
+std::string InputCodeDisplayName(uint16_t code);
+/// Mouse button 1-32 (1 left, 2 right, 3 middle, 4 back, 5 forward) -> code.
+uint16_t InputCodeForMouseButton(int button);
+/// The code to bind a key by, from its SDL scancode: its VirtualKey when that
+/// names it uniquely, else 0x200 + scancode.
+uint16_t InputCodeForScancode(int sdl_scancode);
+/// The SDL scancode SDL's Windows backend gives a WM_KEYDOWN / WM_KEYUP with
+/// these parameters (0 = none). Windows only; 0 elsewhere.
+int Win32KeyMessageToScancode(uintptr_t wparam, intptr_t lparam);
+
 }  // namespace rex::ui

@@ -72,7 +72,9 @@ MouseEvent::Button TranslateSDLMouseButton(Uint8 button) {
     case SDL_BUTTON_X2:
       return MouseEvent::Button::kX2;
     default:
-      return MouseEvent::Button::kNone;
+      // Further buttons keep their number (SDL's Windows raw input reports 6-32).
+      return (button >= 6 && button <= 32) ? static_cast<MouseEvent::Button>(button)
+                                           : MouseEvent::Button::kNone;
   }
 }
 
@@ -559,7 +561,9 @@ void WindowSDL::HandleDropEvent(SDL_Event& event) {
 
 void WindowSDL::HandleKeyEvent(SDL_Event& event) {
   VirtualKey virtual_key = TranslateSDLScancode(event.key.scancode);
-  if (virtual_key == VirtualKey::kNone) {
+  // A key without a VirtualKey still goes out, with its scancode, so it can be
+  // bound (keybind "Scancode<N>"); listeners that need a VirtualKey skip kNone.
+  if (virtual_key == VirtualKey::kNone && event.key.scancode == SDL_SCANCODE_UNKNOWN) {
     return;
   }
   SDL_Keymod mod = event.key.mod;
@@ -569,6 +573,7 @@ void WindowSDL::HandleKeyEvent(SDL_Event& event) {
              /*modifier_ctrl_pressed=*/(mod & SDL_KMOD_CTRL) != 0,
              /*modifier_alt_pressed=*/(mod & SDL_KMOD_ALT) != 0,
              /*modifier_super_pressed=*/(mod & SDL_KMOD_GUI) != 0);
+  e.set_scancode(int(event.key.scancode));
   WindowDestructionReceiver destruction_receiver(this);
   if (event.type == SDL_EVENT_KEY_DOWN) {
     OnKeyDown(e, destruction_receiver);
