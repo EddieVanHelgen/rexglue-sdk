@@ -1036,7 +1036,8 @@ bool PushTestSdlInput(const std::string& token, bool down) {
   if (button) {
     ev.type = down ? SDL_EVENT_MOUSE_BUTTON_DOWN : SDL_EVENT_MOUSE_BUTTON_UP;
     ev.button.windowID = window_id;
-    ev.button.button = Uint8(button);
+    // Input codes count 1 left, 2 right, 3 middle (as MouseEvent::Button); SDL has 2 middle, 3 right.
+    ev.button.button = Uint8(button == 2 ? SDL_BUTTON_RIGHT : button == 3 ? SDL_BUTTON_MIDDLE : button);
     ev.button.down = down;
     ev.button.clicks = 1;
   } else if (code == rex::ui::kInputCodeWheelUp || code == rex::ui::kInputCodeWheelDown ||
