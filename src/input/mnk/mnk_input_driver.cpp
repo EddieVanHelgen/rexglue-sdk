@@ -161,6 +161,8 @@ bool TokenPressed(const KeyState& key_down, std::string_view token, uint8_t live
 std::atomic<bool> mouse_look_active{true};
 std::atomic<bool> menu_mode{false};
 std::atomic<int64_t> last_activity_ns{0};
+std::atomic<bool> zoom_wheel{false};
+std::atomic<int> zoom_wheel_steps{0};
 
 // Pseudo keys (rex::ui input codes): the wheel's four directions (WheelUp,
 // WheelDown, WheelLeft, WheelRight) and mouse buttons 4-32 (Mouse4 ..).
@@ -364,6 +366,14 @@ bool IsMenuMode() {
 
 int64_t LastActivityNs() {
   return last_activity_ns.load(std::memory_order_relaxed);
+}
+
+void SetZoomWheel(bool on) {
+  zoom_wheel.store(on, std::memory_order_relaxed);
+}
+
+int TakeZoomWheelSteps() {
+  return zoom_wheel_steps.exchange(0, std::memory_order_relaxed);
 }
 
 void SetMouseLookActive(bool active) {
@@ -940,6 +950,26 @@ void MnkInputDriver::OnMouseWheel(rex::ui::MouseEvent& e) {
   if (!IsEnabled() || !Focused() || IsPassthroughEnabled() || (e.scroll_y() == 0 && e.scroll_x() == 0))
     return;
   std::lock_guard lock(state_mutex_);
+  // Zoom wheel: while the left trigger's bind is held (aiming), up / down go
+  // to the title's zoom, not to their binds. Notches of 120; smaller
+  // (high-resolution) amounts add up.
+  if (e.scroll_y() != 0 && zoom_wheel.load(std::memory_order_relaxed) && !IsMenuMode() &&
+      (bound_pressed_ & (uint32_t(1) << 6))) {
+    zoom_wheel_acc_ += e.scroll_y();
+    const int steps = zoom_wheel_acc_ / int(rex::ui::MouseEvent::kScrollPerDetent);
+    if (steps != 0) {
+      zoom_wheel_acc_ -= steps * int(rex::ui::MouseEvent::kScrollPerDetent);
+      zoom_wheel_steps.fetch_add(steps, std::memory_order_relaxed);
+      if (LogInputs()) {
+        REXLOG_INFO("mnk: input {} [{}]: zoom wheel ({} step{}, aim held)", steps > 0 ? "Wheel up" : "Wheel down",
+                    steps > 0 ? "WheelUp" : "WheelDown", steps, steps == 1 || steps == -1 ? "" : "s");
+      }
+    }
+    NoteActivity();
+    if (e.scroll_x() == 0) {
+      return;
+    }
+  }
   // y + = away from the user (up); x + = tilted right. One pulse per event;
   // notches arriving during a pulse extend it.
   const int64_t release = NowNs() + kWheelPulseNs;
@@ -947,7 +977,8 @@ void MnkInputDriver::OnMouseWheel(rex::ui::MouseEvent& e) {
     SetInputLocked(kWheelCodes[i], true, "");
     wheel_release_ns_[i] = release;
   };
-  if (e.scroll_y() != 0) {
+  if (e.scroll_y() != 0 && !(zoom_wheel.load(std::memory_order_relaxed) && !IsMenuMode() &&
+                              (bound_pressed_ & (uint32_t(1) << 6)))) {
     pulse(e.scroll_y() > 0 ? 0 : 1);
   }
   if (e.scroll_x() != 0) {

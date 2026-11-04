@@ -36,6 +36,13 @@ bool IsMenuMode();
 /// (0 = none yet).
 int64_t LastActivityNs();
 
+/// Zoom wheel (set by the title, e.g. step zoom): while on and the left
+/// trigger's bind is held outside menu mode, wheel up / down don't press their
+/// binds; their notches are counted for TakeZoomWheelSteps instead.
+void SetZoomWheel(bool on);
+/// Wheel notches counted since the last call (+ up, - down), then cleared.
+int TakeZoomWheelSteps();
+
 class MnkInputDriver final : public InputDriver,
                              public rex::ui::WindowInputListener,
                              public rex::ui::WindowListener {
@@ -115,6 +122,8 @@ class MnkInputDriver final : public InputDriver,
   // Wheel pulses (up, down, left, right): steady_clock ns when the pseudo key
   // is let go (0 = up).
   int64_t wheel_release_ns_[4] = {};
+  // Zoom wheel: scroll amounts not yet a whole notch.
+  int zoom_wheel_acc_ = 0;
 
   // mnk_test_script.
   struct TestInput {
