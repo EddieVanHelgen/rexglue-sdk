@@ -922,6 +922,14 @@ bool XexModule::Load(const std::string_view name, const std::string_view path, c
   return true;
 }
 
+namespace {
+XexModule::ImageTranslator g_image_translator = nullptr;
+}  // namespace
+
+void XexModule::SetImageTranslator(ImageTranslator translator) {
+  g_image_translator = translator;
+}
+
 bool XexModule::LoadContinue() {
   // Second part of image load
   // Split from Load() so that we can patch the XEX before loading this data
@@ -1012,6 +1020,24 @@ bool XexModule::LoadContinue() {
       auto library_name = std::string(string_table[library_name_index]);
       SetupLibraryImports(library_name, library);
       library_offset += library->size;
+    }
+  }
+
+  // The app's loader step (SetImageTranslator), before the read-only sections are protected.
+  if (g_image_translator && !is_patch()) {
+    uint32_t entry = entry_point();
+    const uint32_t old_entry = entry;
+    if (g_image_translator(memory()->TranslateVirtual(base_address_), base_address_,
+                           sec_header->image_size, &entry) &&
+        entry != old_entry) {
+      auto* header = reinterpret_cast<xex2_header*>(xex_header_mem_.data());
+      for (uint32_t i = 0; i < header->header_count; i++) {
+        if (header->headers[i].key == XEX_HEADER_ENTRY_POINT) {
+          header->headers[i].value = entry;
+        }
+      }
+      REXLOG_INFO("XEX image translated by the app's loader step; entry point {:08X} -> {:08X}", old_entry,
+                  entry_point());
     }
   }
 

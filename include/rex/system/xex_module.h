@@ -157,6 +157,14 @@ class XexModule : public Module {
   uint32_t GetProcAddress(uint16_t ordinal) const;
   uint32_t GetProcAddress(const std::string_view name) const;
 
+  // A loader step for another build of the same title (PDZ Restored: the US Platinum Hits disc). Called once per
+  // executable (not a patch) at the end of the load, after the imports are patched and before the memory protection is
+  // set: it may rewrite the loaded image in place (`image` = host pointer to `base`, `size` bytes). It returns true
+  // when it changed the image; `entry_point` (the header's) may then be changed too, and is written back to the XEX
+  // header. Registered by the app before Runtime::LoadXexImage; nullptr (the default) = no step.
+  using ImageTranslator = bool (*)(uint8_t* image, uint32_t base, uint32_t size, uint32_t* entry_point);
+  static void SetImageTranslator(ImageTranslator translator);
+
   int ApplyPatch(XexModule* module);
   bool Load(const std::string_view name, const std::string_view path, const void* xex_addr,
             size_t xex_length);
